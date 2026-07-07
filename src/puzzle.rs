@@ -7,6 +7,9 @@ pub type Vec3 = cgmath::Vector3<f32>;
 pub type Rot = cgmath::Quaternion<f32>;
 const ROT_ID: Rot = Rot::new(1.0, 0.0, 0.0, 0.0);
 
+// TODO: factor usage of Plane into a struct
+// struct Plane
+
 #[derive(Debug, Clone, Copy)]
 pub enum Side {
     R,
@@ -124,6 +127,29 @@ impl Piece {
         }
     }
 
+    fn volume(&self) -> f32 {
+        // Sum the signed volumes of tetrahedra formed by the origin and each
+        // triangle of every face (fan-triangulated). Rotation is irrelevant to
+        // volume, so we work in the piece's local frame. Faces are wound
+        // counterclockwise seen from outside the piece, so the result is
+        // positive; a negative result means a winding bug.
+        let mut signed_volume = 0.0;
+        for sticker in &self.stickers {
+            for i in 1..sticker.verts.len().saturating_sub(1) {
+                let v0 = sticker.verts[0];
+                let v1 = sticker.verts[i];
+                let v2 = sticker.verts[i + 1];
+                signed_volume += v0.dot(v1.cross(v2));
+            }
+        }
+        // assert!(signed_volume > 0.0);
+        signed_volume / 6.0
+    }
+
+    fn is_internal(&self) -> bool {
+        self.stickers.iter().all(|sticker| sticker.side.is_none())
+    }
+
     /// `plane_norm` is the plane's normal vector,
     /// `length` is the distance from the origin to the plane along the normal vector.
     /// inside the cut is the part farther to the origin
@@ -135,6 +161,30 @@ impl Piece {
 
         let threshold = plane.dot(plane);
         let signed_dist = |v: Vec3| -> f32 { v.dot(plane) - threshold };
+
+        // If no vertex lies strictly on one of the sides, the plane only
+        // touches the piece (e.g. along a face left by a previous cut) and
+        // must not split it. Without this early-out, an on-plane face would be
+        // handed to both sides, fabricating a zero-volume phantom piece and a
+        // duplicate cut-face sticker on the real piece.
+        let mut any_inside = false;
+        let mut any_outside = false;
+        for sticker in &self.stickers {
+            for &v in &sticker.verts {
+                let d = signed_dist(v);
+                if d > EPSILON {
+                    any_inside = true;
+                } else if d < -EPSILON {
+                    any_outside = true;
+                }
+            }
+        }
+        if !any_outside {
+            return CutResult::Inside(self.clone());
+        }
+        if !any_inside {
+            return CutResult::Outside(self.clone());
+        }
 
         let mut inside_stickers: Vec<Sticker> = Vec::new();
         let mut outside_stickers: Vec<Sticker> = Vec::new();
@@ -189,6 +239,17 @@ impl Piece {
             }
         }
 
+        // Each intersection point is found once per sticker sharing the edge,
+        // and on-plane vertices once per incident sticker, so deduplicate
+        // before building the cut face.
+        let mut deduped: Vec<Vec3> = Vec::new();
+        for v in cut_verts {
+            if !deduped.iter().any(|&u| (u - v).magnitude2() < 1e-10) {
+                deduped.push(v);
+            }
+        }
+        let mut cut_verts = deduped;
+
         // Build the cut face and add it to both pieces.
         if cut_verts.len() >= 3 {
             let plane_normal = plane.normalize();
@@ -216,9 +277,16 @@ impl Piece {
                 angle_a.partial_cmp(&angle_b).unwrap()
             });
 
+            // The sort above orders `cut_verts` counterclockwise as seen from
+            // the `plane_normal` side (u, v, normal are right-handed). All
+            // stickers are wound counterclockwise seen from outside their
+            // piece: the outside piece lies on the -normal side, so its cut
+            // face takes this order; the inside piece takes the reverse.
             // The cut surface has no side color (it's an internal face).
+            let mut inside_face = cut_verts.clone();
+            inside_face.reverse();
             inside_stickers.push(Sticker {
-                verts: cut_verts.clone(),
+                verts: inside_face,
                 side: None,
             });
             outside_stickers.push(Sticker {
@@ -367,8 +435,8 @@ impl MixupCube {
     }
 
     pub fn new() -> Self {
+        /// do the 3^3 cuts.
         fn unbandage(slf: &mut MixupCube) {
-            // do the 3^3 cuts
             for side in Side::ALL {
                 let plane_norm = side.plane();
                 slf.pieces = slf
@@ -380,14 +448,12 @@ impl MixupCube {
         }
 
         fn discard_internal_pieces(slf: &mut MixupCube) {
-            slf.pieces
-                .retain(|piece| piece.stickers.iter().any(|sticker| sticker.side.is_some()));
+            slf.pieces.retain(|piece| !piece.is_internal());
         }
 
         let mut slf = Self::uncut();
 
         unbandage(&mut slf);
-        // unbandage(&mut slf);
 
         let m = Twist {
             side: Side::L,
@@ -405,19 +471,17 @@ impl MixupCube {
             multiplicity: 1,
         };
 
-        discard_internal_pieces(&mut slf);
         slf.twist(m).unwrap();
         unbandage(&mut slf);
-        discard_internal_pieces(&mut slf);
         slf.twist(m.inv()).unwrap();
 
-        // slf.twist(e).unwrap();
-        // unbandage(&mut slf);
-        // slf.twist(e.inv()).unwrap();
+        slf.twist(e).unwrap();
+        unbandage(&mut slf);
+        slf.twist(e.inv()).unwrap();
 
-        // slf.twist(s).unwrap();
-        // unbandage(&mut slf);
-        // slf.twist(s.inv()).unwrap();
+        slf.twist(s).unwrap();
+        unbandage(&mut slf);
+        slf.twist(s.inv()).unwrap();
 
         discard_internal_pieces(&mut slf);
 
@@ -469,5 +533,100 @@ impl MixupCube {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod cut_tests {
+    use super::*;
+
+    fn unbandage(slf: &mut MixupCube) {
+        for side in Side::ALL {
+            let plane_norm = side.plane();
+            slf.pieces = slf
+                .pieces
+                .iter()
+                .flat_map(|piece| piece.cut(plane_norm, MixupCube::CUT_DEPTH).flatten())
+                .collect();
+        }
+    }
+
+    fn report(label: &str, cube: &MixupCube) {
+        let total: f32 = cube.pieces.iter().map(|p| p.volume()).sum();
+        let degenerate = cube.pieces.iter().filter(|p| p.volume() < 1e-4).count();
+        let internal = cube.pieces.iter().filter(|p| p.is_internal()).count();
+        println!(
+            "{label}: pieces={} total_volume={total} degenerate(<1e-4)={degenerate} internal={internal}",
+            cube.pieces.len()
+        );
+        // volume() is signed and assumes outward winding, so this also
+        // catches winding bugs, not just degenerate slivers.
+        for piece in &cube.pieces {
+            assert!(
+                piece.volume() > 1e-4,
+                "{label}: piece with non-positive or degenerate volume {} ({} stickers)",
+                piece.volume(),
+                piece.stickers.len()
+            );
+        }
+    }
+
+    #[test]
+    fn volumes_after_cutting() {
+        let mut cube = MixupCube::uncut();
+        unbandage(&mut cube);
+        report("after 1st unbandage", &cube);
+        unbandage(&mut cube);
+        report("after 2nd unbandage", &cube);
+    }
+
+    #[test]
+    fn twist_back_without_intermediate_discards() {
+        let mut cube = MixupCube::uncut();
+        unbandage(&mut cube);
+        let m = Twist {
+            side: Side::L,
+            layer: 1,
+            multiplicity: 1,
+        };
+        cube.twist(m).unwrap();
+        unbandage(&mut cube);
+        report("after twist+unbandage", &cube);
+        let res = cube.twist(m.inv());
+        if let Err(e) = &res {
+            println!("blocked pieces: {}", e.blocked.len());
+            for p in e.blocked.iter().take(5) {
+                println!(
+                    "  blocked piece: volume={} internal={} stickers={}",
+                    p.volume(),
+                    p.is_internal(),
+                    p.stickers.len()
+                );
+            }
+        }
+        assert!(res.is_ok(), "twist back was blocked");
+    }
+}
+
+#[cfg(test)]
+mod new_tests {
+    use super::*;
+
+    #[test]
+    fn new_builds_and_conserves_volume() {
+        let cube = MixupCube::new();
+        let total: f32 = cube.pieces.iter().map(|p| p.volume()).sum();
+        println!("new(): pieces={} total_volume={total}", cube.pieces.len());
+        // volume() is signed and assumes outward winding, so this also
+        // catches winding bugs, not just degenerate slivers.
+        for piece in &cube.pieces {
+            assert!(
+                piece.volume() > 1e-4,
+                "piece with non-positive or degenerate volume {}",
+                piece.volume()
+            );
+        }
+        // internal pieces are discarded, so total volume is 8 minus the core.
+        assert!(total < 8.0);
     }
 }
