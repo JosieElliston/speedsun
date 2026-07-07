@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Instant};
 
 use cgmath::{Rotation, Rotation3};
 use eframe::egui::{self, mutex::Mutex};
-use itertools::Itertools;
+use euc::{buffer::Buffer2d, rasterizer, Pipeline};
 
 use crate::puzzle_state::*;
 
@@ -17,6 +17,8 @@ pub struct PuzzleView {
     // /// shrink to sticker centroid.
     // sticker_scale: f32,
     // outlines,
+    /// the software-rendered frame, re-uploaded to the GPU each draw.
+    texture: Option<egui::TextureHandle>,
 }
 impl PuzzleView {
     pub fn new(puzzle: Arc<Mutex<PuzzleState>>) -> Self {
@@ -27,55 +29,106 @@ impl PuzzleView {
             show_internal_stickers: true,
             // piece_explode: 1.0,
             // sticker_scale: 1.0,
+            texture: None,
         }
     }
 
     // fn sticker_of_pos(&self, pos: egui::Pos2) -> Option<PieceId> {}
     // fn piece_of_pos(&self, pos: egui::Pos2) -> Option<PieceId> {}
 
-    pub fn draw(&self, painter: &egui::Painter, now: Instant) {
+    pub fn draw(&mut self, painter: &egui::Painter, _now: Instant) {
         let puzzle = self.puzzle.lock();
 
         let rect = painter.clip_rect();
-        let rect_center = rect.center();
+        let ctx = painter.ctx();
+
+        // Render into a buffer sized in physical pixels so the result is crisp
+        // regardless of the display's scale factor.
+        let ppp = ctx.pixels_per_point();
+        let w = ((rect.width() * ppp).round() as usize).clamp(1, 4096);
+        let h = ((rect.height() * ppp).round() as usize).clamp(1, 4096);
+
+        // The puzzle is rendered orthographically. `sx`/`sy` map world units to
+        // NDC while keeping the puzzle square in a non-square viewport (matching
+        // the old `size().min_elem()` behaviour) with a margin around the edges.
+        // TODO: have puzzle_scale instead
         const MARGIN: f32 = 0.9;
-        let rect_half_size = rect.size().min_elem() / 4.0 * MARGIN;
+        let min = w.min(h) as f32;
+        let sx = min * MARGIN / (2.0 * w as f32);
+        let sy = min * MARGIN / (2.0 * h as f32);
 
-        // you're supposed to have a per-pixel depth buffer.
-        // sorting is a optimization to avoid overdraw,
-        // but isn't correct on its own.
-
-        let sticker_projs = puzzle
-            .pieces
-            .iter()
-            .flat_map(|piece| piece.stickers.iter().zip(std::iter::repeat(piece)))
-            .filter(|(sticker, _)| self.show_internal_stickers || sticker.side.is_some())
-            .map(|(sticker, piece)| {
-                let mut verts = Vec::new();
-                let mut total_depth = 0.0;
-                for &v in &sticker.verts {
-                    let (p, d) = self.cam.proj(piece.rot * v);
-                    verts.push(rect_center + p * rect_half_size);
-                    total_depth += d;
+        // Correct visibility needs a per-pixel depth buffer, not a per-sticker
+        // depth sort: sorting can't resolve interpenetrating or cyclically
+        // overlapping polygons. We rasterize every sticker triangle on the CPU
+        // with `euc`, which does per-pixel depth testing, then blit the result.
+        let mut vertices: Vec<Vertex> = Vec::new();
+        for piece in &puzzle.pieces {
+            for sticker in &piece.stickers {
+                if !(self.show_internal_stickers || sticker.side.is_some()) {
+                    continue;
                 }
-                let depth = total_depth / verts.len() as f32;
-                (sticker, verts, depth)
-            })
-            .sorted_by(|(_, _, d1), (_, _, d2)| d2.partial_cmp(d1).unwrap())
-            .map(|(sticker, verts, _d)| (sticker, verts))
-            .collect_vec();
-
-        for (sticker, pos) in sticker_projs {
-            let color = sticker
-                .side
-                .map_or(egui::Color32::GRAY, |side| side.color());
-            painter.add(egui::epaint::PathShape {
-                points: pos.into_iter().collect(),
-                closed: true,
-                fill: color,
-                stroke: egui::epaint::PathStroke::new(1.0, egui::Color32::BLACK),
-            });
+                let color = sticker
+                    .side
+                    .map_or(egui::Color32::GRAY, |side| side.color());
+                let rgb = (
+                    color.r() as f32 / 255.0,
+                    color.g() as f32 / 255.0,
+                    color.b() as f32 / 255.0,
+                );
+                let clip: Vec<[f32; 4]> = sticker
+                    .verts
+                    .iter()
+                    .map(|&v| self.cam.proj_clip(piece.rot * v, sx, sy))
+                    .collect();
+                // Fan-triangulate the (convex) sticker polygon.
+                for i in 1..clip.len().saturating_sub(1) {
+                    vertices.push((clip[0], rgb));
+                    vertices.push((clip[i], rgb));
+                    vertices.push((clip[i + 1], rgb));
+                }
+            }
         }
+
+        let mut color_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
+        let mut depth_buf = Buffer2d::new([w, h], 1.0f32);
+        StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
+            &vertices,
+            &mut color_buf,
+            Some(&mut depth_buf),
+        );
+
+        let image = egui::ColorImage::new([w, h], color_buf.as_ref().to_vec());
+        let options = egui::TextureOptions::NEAREST;
+        match &mut self.texture {
+            Some(tex) => tex.set(image, options),
+            None => self.texture = Some(ctx.load_texture("puzzle", image, options)),
+        }
+        let texture_id = self.texture.as_ref().unwrap().id();
+
+        let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        painter.image(texture_id, rect, uv, egui::Color32::WHITE);
+    }
+}
+
+/// A clip-space position plus an (r, g, b) color carried to the fragment stage.
+type Vertex = ([f32; 4], (f32, f32, f32));
+
+/// CPU rasterization pipeline for the flat-shaded stickers. Depth testing uses
+/// `euc`'s default `IfLessWrite` strategy against the depth buffer.
+struct StickerPipeline;
+impl Pipeline for StickerPipeline {
+    type Vertex = Vertex;
+    type VsOut = (f32, f32, f32);
+    type Pixel = egui::Color32;
+
+    #[inline(always)]
+    fn vert(&self, (pos, rgb): &Self::Vertex) -> ([f32; 4], Self::VsOut) {
+        (*pos, *rgb)
+    }
+
+    #[inline(always)]
+    fn frag(&self, (r, g, b): &Self::VsOut) -> Self::Pixel {
+        egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
     }
 }
 
@@ -96,12 +149,15 @@ impl Camera {
         }
     }
 
-    /// returns (egui::Pos2, depth)
-    fn proj(&self, pos: Vec3) -> (egui::Vec2, f32) {
+    /// Project a world-space point to clip space (`[x, y, z, w]`, orthographic so
+    /// `w = 1`). `sx`/`sy` scale x/y into NDC; z is a normalized depth in `[0, 1]`
+    /// where smaller means nearer, matching `euc`'s `IfLessWrite` depth test.
+    fn proj_clip(&self, pos: Vec3, sx: f32, sy: f32) -> [f32; 4] {
         let pos = self.rot.rotate_vector(pos);
-        let depth = -pos.z;
-        let pos = egui::Vec2::new(pos.x, -pos.y);
-        (pos, depth)
+        // Cube corners reach |coord| ~= sqrt(3); R = 2 keeps z comfortably in [0, 1].
+        const R: f32 = 2.0;
+        let z = 0.5 - pos.z / (2.0 * R);
+        [pos.x * sx, pos.y * sy, z, 1.0]
     }
 
     pub fn drag(&mut self, dv: egui::Vec2, sensitivity: f32) {
