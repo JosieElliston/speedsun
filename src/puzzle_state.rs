@@ -1,4 +1,4 @@
-use cgmath::{InnerSpace, One, Rotation, Rotation3};
+use cgmath::{InnerSpace, Rotation, Rotation3};
 use eframe::egui;
 
 // in [-1, 1]^3
@@ -317,38 +317,6 @@ impl Piece {
         }
     }
 
-    // /// `plane_norm` is the plane's normal vector,
-    // /// `length` is the distance from the origin to the plane along the normal vector.
-    // /// inside the cut is the part farther to the origin
-    // /// (and thus inside the grip).
-    // fn cut(&self, plane_norm: Vec3, length: f32) -> CutResult {
-    //     let plane = self.rot.invert() * (plane_norm * length);
-
-    //     let sd = |v: Vec3| -> f32 { v.dot(plane) - plane.dot(plane) };
-
-    //     let mut new_verts = Vec::new();
-
-    //     for sticker in &self.stickers {
-    //         // if the stickers are all on the same side, continue
-    //         {
-    //             let mut any_inside = false;
-    //             let mut any_outside = false;
-    //             for &v in &sticker.verts {
-    //                 let d = sd(v);
-    //                 if d > 0.0 {
-    //                     any_inside = true;
-    //                 } else if d < 0.0 {
-    //                     any_outside = true;
-    //                 }
-    //             }
-    //             if !any_inside || !any_outside {
-    //                 continue;
-    //             }
-    //         }
-
-    //     }
-    // }
-
     /// negative length means that more than half the space would be considered "inside" the cut.
     fn is_split_by(&self, plane_norm: Vec3, length: f32) -> IsSplitResult {
         const EPSILON: f32 = 1e-6;
@@ -420,10 +388,10 @@ pub struct TwistError {
 }
 
 #[derive(Debug)]
-pub struct MixupCube {
+pub struct PuzzleState {
     pub pieces: Vec<Piece>,
 }
-impl MixupCube {
+impl PuzzleState {
     const CUT_DEPTH: f32 = std::f32::consts::SQRT_2 - 1.0;
 
     /// the full primordial shape.
@@ -441,7 +409,7 @@ impl MixupCube {
             self.pieces = self
                 .pieces
                 .iter()
-                .flat_map(|piece| piece.cut(plane_norm, MixupCube::CUT_DEPTH).flatten())
+                .flat_map(|piece| piece.cut(plane_norm, PuzzleState::CUT_DEPTH).flatten())
                 .collect();
         }
     }
@@ -540,7 +508,7 @@ impl MixupCube {
 mod cut_tests {
     use super::*;
 
-    fn report(label: &str, cube: &MixupCube) {
+    fn report(label: &str, cube: &PuzzleState) {
         let total: f32 = cube.pieces.iter().map(|p| p.volume()).sum();
         let degenerate = cube.pieces.iter().filter(|p| p.volume() < 1e-4).count();
         let internal = cube.pieces.iter().filter(|p| p.is_internal()).count();
@@ -562,7 +530,7 @@ mod cut_tests {
 
     #[test]
     fn volumes_after_cutting() {
-        let mut cube = MixupCube::uncut();
+        let mut cube = PuzzleState::uncut();
         cube.unbandage();
         report("after 1st unbandage", &cube);
         cube.unbandage();
@@ -571,7 +539,7 @@ mod cut_tests {
 
     #[test]
     fn twist_back_without_intermediate_discards() {
-        let mut cube = MixupCube::uncut();
+        let mut cube = PuzzleState::uncut();
         cube.unbandage();
         let m = Twist {
             side: Side::L,
@@ -603,7 +571,7 @@ mod new_tests {
 
     #[test]
     fn new_builds_and_conserves_volume() {
-        let cube = MixupCube::new();
+        let cube = PuzzleState::new();
         let total: f32 = cube.pieces.iter().map(|p| p.volume()).sum();
         println!("new(): pieces={} total_volume={total}", cube.pieces.len());
         // volume() is signed and assumes outward winding, so this also

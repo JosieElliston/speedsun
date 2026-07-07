@@ -1,8 +1,7 @@
 mod app;
-mod camera;
 mod filters;
-mod puzzle;
-pub mod puzzle_view;
+mod puzzle_state;
+mod puzzle_view;
 
 fn main() -> Result<(), eframe::Error> {
     // let puzzle = puzzle::MixupCube::new();

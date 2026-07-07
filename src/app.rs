@@ -1,17 +1,20 @@
-use eframe::egui;
+use std::{sync::Arc, time::Instant};
 
-use crate::{camera::*, puzzle::*};
+use eframe::egui::{self, mutex::Mutex};
+
+use crate::{puzzle_state::*, puzzle_view::*};
 
 pub struct App {
-    camera: Camera,
-    puzzle: MixupCube,
+    puzzle: Arc<Mutex<PuzzleState>>,
+    puzzle_view: PuzzleView,
     layer: u8,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let puzzle = Arc::new(Mutex::new(PuzzleState::new()));
         Self {
-            camera: Camera::new(),
-            puzzle: MixupCube::new(),
+            puzzle: Arc::clone(&puzzle),
+            puzzle_view: PuzzleView::new(Arc::clone(&puzzle)),
             layer: 0,
         }
     }
@@ -28,14 +31,14 @@ impl eframe::App for App {
             for side in Side::ALL {
                 ui.horizontal(|ui| {
                     if ui.button(format!("{side:?}'")).clicked() {
-                        let r = self.puzzle.twist(Twist {
+                        let r = self.puzzle.lock().twist(Twist {
                             side,
                             layer: self.layer,
                             multiplicity: -1,
                         });
                     }
                     if ui.button(format!("{side:?}")).clicked() {
-                        let r = self.puzzle.twist(Twist {
+                        let r = self.puzzle.lock().twist(Twist {
                             side,
                             layer: self.layer,
                             multiplicity: 1,
@@ -53,10 +56,10 @@ impl eframe::App for App {
             {
                 const SENSITIVITY: f32 = 0.5;
                 let drag = response.drag_delta();
-                self.camera.drag(drag, SENSITIVITY);
+                self.puzzle_view.cam.drag(drag, SENSITIVITY);
             }
 
-            crate::camera::show(ui, rect, &self.camera, &self.puzzle);
+            self.puzzle_view.draw(&ui.painter_at(rect), Instant::now());
         });
     }
 }
