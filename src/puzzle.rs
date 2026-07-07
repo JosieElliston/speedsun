@@ -434,26 +434,26 @@ impl MixupCube {
         }
     }
 
+    /// do the 3^3 cuts.
+    fn unbandage(&mut self) {
+        for side in Side::ALL {
+            let plane_norm = side.plane();
+            self.pieces = self
+                .pieces
+                .iter()
+                .flat_map(|piece| piece.cut(plane_norm, MixupCube::CUT_DEPTH).flatten())
+                .collect();
+        }
+    }
+
+    fn discard_internal_pieces(&mut self) {
+        self.pieces.retain(|piece| !piece.is_internal());
+    }
+
     pub fn new() -> Self {
-        /// do the 3^3 cuts.
-        fn unbandage(slf: &mut MixupCube) {
-            for side in Side::ALL {
-                let plane_norm = side.plane();
-                slf.pieces = slf
-                    .pieces
-                    .iter()
-                    .flat_map(|piece| piece.cut(plane_norm, MixupCube::CUT_DEPTH).flatten())
-                    .collect();
-            }
-        }
-
-        fn discard_internal_pieces(slf: &mut MixupCube) {
-            slf.pieces.retain(|piece| !piece.is_internal());
-        }
-
         let mut slf = Self::uncut();
 
-        unbandage(&mut slf);
+        slf.unbandage();
 
         let m = Twist {
             side: Side::L,
@@ -472,18 +472,18 @@ impl MixupCube {
         };
 
         slf.twist(m).unwrap();
-        unbandage(&mut slf);
+        slf.unbandage();
         slf.twist(m.inv()).unwrap();
 
         slf.twist(e).unwrap();
-        unbandage(&mut slf);
+        slf.unbandage();
         slf.twist(e.inv()).unwrap();
 
         slf.twist(s).unwrap();
-        unbandage(&mut slf);
+        slf.unbandage();
         slf.twist(s.inv()).unwrap();
 
-        discard_internal_pieces(&mut slf);
+        slf.discard_internal_pieces();
 
         slf
     }
@@ -540,17 +540,6 @@ impl MixupCube {
 mod cut_tests {
     use super::*;
 
-    fn unbandage(slf: &mut MixupCube) {
-        for side in Side::ALL {
-            let plane_norm = side.plane();
-            slf.pieces = slf
-                .pieces
-                .iter()
-                .flat_map(|piece| piece.cut(plane_norm, MixupCube::CUT_DEPTH).flatten())
-                .collect();
-        }
-    }
-
     fn report(label: &str, cube: &MixupCube) {
         let total: f32 = cube.pieces.iter().map(|p| p.volume()).sum();
         let degenerate = cube.pieces.iter().filter(|p| p.volume() < 1e-4).count();
@@ -574,23 +563,23 @@ mod cut_tests {
     #[test]
     fn volumes_after_cutting() {
         let mut cube = MixupCube::uncut();
-        unbandage(&mut cube);
+        cube.unbandage();
         report("after 1st unbandage", &cube);
-        unbandage(&mut cube);
+        cube.unbandage();
         report("after 2nd unbandage", &cube);
     }
 
     #[test]
     fn twist_back_without_intermediate_discards() {
         let mut cube = MixupCube::uncut();
-        unbandage(&mut cube);
+        cube.unbandage();
         let m = Twist {
             side: Side::L,
             layer: 1,
             multiplicity: 1,
         };
         cube.twist(m).unwrap();
-        unbandage(&mut cube);
+        cube.unbandage();
         report("after twist+unbandage", &cube);
         let res = cube.twist(m.inv());
         if let Err(e) = &res {
