@@ -1,0 +1,11 @@
+[package]
+name = "speedsun"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+approx_collections = "4.1.0"
+cgmath = "0.18.0"
+eframe = "0.35.0"
+itertools = "0.15.0"
+rand = "0.10.2"
