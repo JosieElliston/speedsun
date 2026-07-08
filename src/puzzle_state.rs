@@ -411,7 +411,8 @@ impl Twist {
 
 #[derive(Debug)]
 pub struct TwistError {
-    pub blocked: Vec<Piece>,
+    /// indices into pieces of the pieces straddling the twist's boundary.
+    pub blocked: Vec<usize>,
 }
 
 #[derive(Debug)]
@@ -514,12 +515,7 @@ impl PuzzleState {
         }
 
         if !blocked.is_empty() {
-            return Err(TwistError {
-                blocked: blocked
-                    .into_iter()
-                    .map(|i| self.pieces[i].clone())
-                    .collect(),
-            });
+            return Err(TwistError { blocked });
         }
 
         Ok(inside)
@@ -585,7 +581,8 @@ mod cut_tests {
         let res = cube.twist(m.inv());
         if let Err(e) = &res {
             println!("blocked pieces: {}", e.blocked.len());
-            for p in e.blocked.iter().take(5) {
+            for &i in e.blocked.iter().take(5) {
+                let p = &cube.pieces[i];
                 println!(
                     "  blocked piece: volume={} internal={} stickers={}",
                     p.volume(),

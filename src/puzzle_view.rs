@@ -6,7 +6,7 @@ use std::{
 
 use cgmath::{Rotation, Rotation3};
 use eframe::egui::{self, mutex::Mutex};
-use euc::{Pipeline, buffer::Buffer2d, rasterizer};
+use euc::{Pipeline, Target, buffer::Buffer2d, rasterizer};
 
 use crate::puzzle_state::*;
 
@@ -51,6 +51,20 @@ enum AnimMode {
     Frame { progress: f32, n_frames: f32 },
 }
 
+/// tints the pieces that blocked a twist red, fading out.
+struct BlockedFlash {
+    /// indices into puzzle.pieces of the blocking pieces.
+    pieces: Vec<usize>,
+    start: Instant,
+}
+impl BlockedFlash {
+    /// red tint strength in [0, 1]; 0 means expired.
+    fn strength(&self, now: Instant, duration: f32) -> f32 {
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / duration;
+        (1.0 - t).max(0.0)
+    }
+}
+
 /// how a twist's progress begins: fresh from the queue, or carrying the
 /// previous twist's overshoot so back-to-back twists keep a steady cadence.
 enum AnimStart {
@@ -67,6 +81,9 @@ pub struct PuzzleView {
     rot: Rot,
     active_twist: Option<ActiveTwist>,
     twist_queue: VecDeque<Twist>,
+    blocked_flash: Option<BlockedFlash>,
+    /// seconds the pieces blocking a rejected twist stay tinted red.
+    blocked_flash_duration: f32,
     /// seconds per twist animation.
     twist_duration: f32,
     // selected_pieces: Vec<PieceId>,
@@ -94,6 +111,8 @@ impl PuzzleView {
             rot: Rot::from_angle_x(cgmath::Deg(20.0)) * Rot::from_angle_y(cgmath::Deg(-30.0)),
             active_twist: None,
             twist_queue: VecDeque::new(),
+            blocked_flash: None,
+            blocked_flash_duration: 0.4,
             twist_duration: 0.15,
             show_internal_stickers: true,
             backface_culling: true,
@@ -122,6 +141,11 @@ impl PuzzleView {
             egui::Slider::new(&mut self.twist_duration, 0.01..=1.0)
                 .logarithmic(true)
                 .text("twist duration"),
+        );
+        ui.add(
+            egui::Slider::new(&mut self.blocked_flash_duration, 0.05..=2.0)
+                .logarithmic(true)
+                .text("blocked flash duration"),
         );
     }
 
@@ -187,8 +211,14 @@ impl PuzzleView {
         while let Some(twist) = self.twist_queue.pop_front() {
             let pieces = match puzzle.twist_pieces(twist) {
                 Ok(pieces) => pieces,
-                // blocked: drop it. TODO: surface blocked twists in the UI.
-                Err(_) => continue,
+                // blocked: drop the twist and flash the blocking pieces.
+                Err(e) => {
+                    self.blocked_flash = Some(BlockedFlash {
+                        pieces: e.blocked,
+                        start: now,
+                    });
+                    continue;
+                }
             };
             let n_frames = self.twist_duration / stable_dt.clamp(1e-4, 1.0);
             let mode = if n_frames < FAST_MODE_MAX_FRAMES {
@@ -202,7 +232,12 @@ impl PuzzleView {
                 AnimMode::Frame { progress, n_frames }
             } else {
                 let start = match start {
-                    AnimStart::Fresh | AnimStart::CarryFrames(_) => now,
+                    // backdate by one frame so the first drawn frame already
+                    // shows motion (matching Frame mode's 1/n_frames start);
+                    // starting at rest reads as input lag.
+                    AnimStart::Fresh | AnimStart::CarryFrames(_) => {
+                        now - Duration::from_secs_f32(stable_dt)
+                    }
                     AnimStart::CarryTime(t) => t,
                 };
                 AnimMode::Time { start }
@@ -245,6 +280,20 @@ impl PuzzleView {
         let stable_dt = ctx.input(|i| i.stable_dt);
         self.advance_twist(&mut puzzle, now, stable_dt);
 
+        if let Some(flash) = &self.blocked_flash {
+            if flash.strength(now, self.blocked_flash_duration) <= 0.0 {
+                self.blocked_flash = None;
+            }
+        }
+        // Red tint mask for the pieces that blocked a rejected twist.
+        let flash: Option<(Vec<bool>, f32)> = self.blocked_flash.as_ref().map(|flash| {
+            let mut mask = vec![false; puzzle.pieces.len()];
+            for &i in &flash.pieces {
+                mask[i] = true;
+            }
+            (mask, flash.strength(now, self.blocked_flash_duration))
+        });
+
         // Partial rotation of the animating layer's pieces. The angle formula
         // must match PuzzleState::twist exactly so progress 1 converges to the
         // applied state.
@@ -277,11 +326,15 @@ impl PuzzleView {
         // overlapping polygons. We rasterize every sticker triangle on the CPU
         // with `euc`, which does per-pixel depth testing, then blit the result.
         let mut vertices: Vec<Vertex> = Vec::new();
+        // pure-red copies of the blocked pieces' triangles, overlaid on top of
+        // the normally-drawn scene with stylized transparency.
+        let mut flash_vertices: Vec<Vertex> = Vec::new();
         for (piece_idx, piece) in puzzle.pieces.iter().enumerate() {
             let piece_rot = match &anim {
                 Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
                 _ => piece.rot,
             };
+            let flashed = matches!(&flash, Some((mask, _)) if mask[piece_idx]);
 
             // The piece's centroid (puzzle space, before the view rotation) is
             // the direction it explodes along. A piece with no vertices has
@@ -320,27 +373,56 @@ impl PuzzleView {
                     vertices.push((clip[i], rgb));
                     vertices.push((clip[i + 1], rgb));
                 }
+                if flashed {
+                    const RED: (f32, f32, f32) = (1.0, 0.0, 0.0);
+                    for i in 1..clip.len().saturating_sub(1) {
+                        flash_vertices.push((clip[0], RED));
+                        flash_vertices.push((clip[i], RED));
+                        flash_vertices.push((clip[i + 1], RED));
+                    }
+                }
             }
         }
 
         let mut color_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
         let mut depth_buf = Buffer2d::new([w, h], 1.0f32);
-        // Backface culling is a compile-time type param in euc, so branch over the
-        // two monomorphizations. All stickers are wound counterclockwise as seen
-        // from outside their piece, so back faces are the ones hidden inside.
-        if self.backface_culling {
-            StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingEnabled>, _>(
-                &vertices,
-                &mut color_buf,
-                Some(&mut depth_buf),
-            );
-        } else {
-            StickerPipeline
-                .draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
-                    &vertices,
+        rasterize(
+            &vertices,
+            &mut color_buf,
+            &mut depth_buf,
+            self.backface_culling,
+        );
+        if let Some((_, strength)) = &flash {
+            if !flash_vertices.is_empty() {
+                // Stylized transparency, as in
+                // https://ajfarkas.dev/blog/hsc2-transparency/: render the red
+                // overlay opaquely into a copy of the frame, then blend
+                // output = (1 - s) * base + s * overlay. Per pixel only the
+                // nearest red surface shows, with no fog-like
+                // transparent-on-transparent buildup. The fresh depth buffer
+                // puts the red on top of all normal geometry (it still
+                // self-occludes, though that's invisible in a solid color).
+                // The convex combination is also correct for premultiplied
+                // alpha, so the overlay works over the transparent background.
+                let base = color_buf.as_ref().to_vec();
+                depth_buf.clear(1.0);
+                rasterize(
+                    &flash_vertices,
                     &mut color_buf,
-                    Some(&mut depth_buf),
+                    &mut depth_buf,
+                    self.backface_culling,
                 );
+                let s = *strength;
+                let lerp = |b: u8, o: u8| ((1.0 - s) * b as f32 + s * o as f32).round() as u8;
+                for (over, base) in color_buf.as_mut().iter_mut().zip(&base) {
+                    *over = egui::Color32::from_rgba_premultiplied(
+                        lerp(base.r(), over.r()),
+                        lerp(base.g(), over.g()),
+                        lerp(base.b(), over.b()),
+                        lerp(base.a(), over.a()),
+                    );
+                }
+            }
         }
 
         let image = egui::ColorImage::new([w, h], color_buf.as_ref().to_vec());
@@ -358,6 +440,30 @@ impl PuzzleView {
 
 /// A clip-space position plus an (r, g, b) color carried to the fragment stage.
 type Vertex = ([f32; 4], (f32, f32, f32));
+
+/// Backface culling is a compile-time type param in euc, so branch over the
+/// two monomorphizations. All stickers are wound counterclockwise as seen
+/// from outside their piece, so back faces are the ones hidden inside.
+fn rasterize(
+    vertices: &[Vertex],
+    color_buf: &mut Buffer2d<egui::Color32>,
+    depth_buf: &mut Buffer2d<f32>,
+    backface_culling: bool,
+) {
+    if backface_culling {
+        StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingEnabled>, _>(
+            vertices,
+            color_buf,
+            Some(depth_buf),
+        );
+    } else {
+        StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
+            vertices,
+            color_buf,
+            Some(depth_buf),
+        );
+    }
+}
 
 /// CPU rasterization pipeline for the flat-shaded stickers. Depth testing uses
 /// `euc`'s default `IfLessWrite` strategy against the depth buffer.
