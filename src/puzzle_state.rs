@@ -21,6 +21,7 @@ pub enum Side {
 }
 impl Side {
     pub const ALL: [Side; 6] = [Side::R, Side::L, Side::U, Side::D, Side::F, Side::B];
+    pub const POS: [Side; 3] = [Side::R, Side::U, Side::F];
 
     pub fn color(&self) -> egui::Color32 {
         match self {
@@ -467,38 +468,31 @@ impl PuzzleState {
     pub fn new() -> Self {
         let mut slf = Self::uncut();
 
-        slf.unbandage();
-
-        let m = Twist {
-            side: Side::L,
+        let twists = Side::POS.map(|side| Twist {
+            side,
             layer: 1,
             multiplicity: 1,
-        };
-        let e = Twist {
-            side: Side::D,
-            layer: 1,
-            multiplicity: 1,
-        };
-        let s = Twist {
-            side: Side::F,
-            layer: 1,
-            multiplicity: 1,
-        };
+        });
 
-        slf.twist(m).unwrap();
+        fn f(twists: &[Twist; 3], slf: &mut PuzzleState, depth: usize) {
+            if depth == 0 {
+                return;
+            }
+            for twist in twists {
+                slf.twist(*twist).unwrap();
+                slf.unbandage();
+                f(twists, slf, depth - 1);
+                slf.twist(twist.inv()).unwrap();
+            }
+        }
+
         slf.unbandage();
-        slf.twist(m.inv()).unwrap();
-
-        slf.twist(e).unwrap();
-        slf.unbandage();
-        slf.twist(e.inv()).unwrap();
-
-        slf.twist(s).unwrap();
-        slf.unbandage();
-        slf.twist(s.inv()).unwrap();
-
+        // needs to be 2 for the mixup cube,
+        // but for some crashes at 4.
+        // (the doctrinaire fails for all cut depths, probably due to accumulated error.)
+        const DEPTH: usize = 2;
+        f(&twists, &mut slf, DEPTH);
         slf.discard_internal_pieces();
-
         slf
     }
 
@@ -552,7 +546,10 @@ impl PuzzleState {
 }
 
 #[cfg(test)]
-mod cut_tests {
+mod tests {
+    use cgmath::AbsDiffEq;
+    use itertools::Itertools;
+
     use super::*;
 
     fn report(label: &str, cube: &PuzzleState) {
@@ -611,11 +608,6 @@ mod cut_tests {
         }
         assert!(res.is_ok(), "twist back was blocked");
     }
-}
-
-#[cfg(test)]
-mod new_tests {
-    use super::*;
 
     #[test]
     fn new_builds_and_conserves_volume() {
@@ -633,5 +625,47 @@ mod new_tests {
         }
         // internal pieces are discarded, so total volume is 8 minus the core.
         assert!(total < 8.0);
+    }
+
+    // TODO: float interning with approx_collections
+    #[test]
+    fn doctrinaire() {
+        const DEPTH: usize = 4;
+        let twists: [Twist; 9] = Side::ALL
+            .map(|side| Twist {
+                side,
+                layer: 0,
+                multiplicity: 2,
+            })
+            .into_iter()
+            .chain(Side::POS.map(|side| Twist {
+                side,
+                layer: 1,
+                multiplicity: 1,
+            }))
+            .collect_array()
+            .unwrap();
+
+        let mut puzzle = PuzzleState::new();
+
+        fn f(twists: &[Twist; 9], puzzle: &mut PuzzleState, depth: usize) {
+            if depth == 0 {
+                return;
+            }
+            for twist in twists {
+                puzzle.twist(*twist).unwrap();
+                f(twists, puzzle, depth - 1);
+                puzzle.twist(twist.inv()).unwrap();
+            }
+        }
+
+        f(&twists, &mut puzzle, DEPTH);
+
+        for piece in &puzzle.pieces {
+            assert!(
+                piece.rot.abs_diff_eq(&ROT_ID, 1e-6),
+                "piece not returned to original orientation"
+            );
+        }
     }
 }
