@@ -366,7 +366,7 @@ impl Filters {
         ui.horizontal(|ui| {
             ui.strong("sequences");
             if ui
-                .small_button("+")
+                .button("+")
                 .on_hover_text("insert a new sequence after the selected one")
                 .clicked()
             {
@@ -398,14 +398,14 @@ impl Filters {
                     }
                     if n_seqs > 1
                         && ui
-                            .small_button("−")
+                            .button("-")
                             .on_hover_text("delete this sequence")
                             .clicked()
                     {
                         remove_seq = Some(i);
                     }
                     if ui
-                        .small_button("+ stage")
+                        .button("+ stage")
                         .on_hover_text("insert a copy of the selected stage below this row")
                         .clicked()
                     {
@@ -425,15 +425,12 @@ impl Filters {
                                     select_stage = Some(j);
                                 }
                                 if n_stages > 1
-                                    && ui
-                                        .small_button("−")
-                                        .on_hover_text("delete this stage")
-                                        .clicked()
+                                    && ui.button("-").on_hover_text("delete this stage").clicked()
                                 {
                                     remove_stage = Some(j);
                                 }
                                 if ui
-                                    .small_button("+ stage")
+                                    .button("+ stage")
                                     .on_hover_text(
                                         "insert a copy of the selected stage below this row",
                                     )
@@ -499,7 +496,7 @@ impl Filters {
                 );
                 let header = state.show_header(ui, |ui| {
                     ui.label(term.set.label());
-                    if ui.small_button("−").clicked() {
+                    if ui.button("-").clicked() {
                         remove_term = Some(term_idx);
                     }
                 });
@@ -512,7 +509,7 @@ impl Filters {
                                 for side in Side::ALL {
                                     side_state_ui(ui, side, set_term);
                                 }
-                                if n_rows > 1 && ui.small_button("−").clicked() {
+                                if n_rows > 1 && ui.button("-").clicked() {
                                     remove_row = Some(row_idx);
                                 }
                             });
@@ -521,8 +518,7 @@ impl Filters {
                     if let Some(row_idx) = remove_row {
                         term.set.terms.remove(row_idx);
                     }
-                    // another union row.
-                    if ui.small_button("+").clicked() {
+                    if ui.button("+").clicked() {
                         term.set.terms.push(PieceSetTerm::default());
                     }
                     box_style_ui(ui, "term_style", "style", true, &mut term.style, &shared);
@@ -612,7 +608,7 @@ impl Filters {
     fn ui_shared_styles(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("shared styles");
-            if ui.small_button("+").clicked() {
+            if ui.button("+").clicked() {
                 self.shared_styles.push(Rc::new(RefCell::new(SharedStyle {
                     name: format!("style {}", self.shared_styles.len()),
                     style: PartialStyle::NONE,
@@ -630,7 +626,7 @@ impl Filters {
                 );
                 let header = state.show_header(ui, |ui| {
                     name_button(ui, &mut style.name, false);
-                    if ui.small_button("−").clicked() {
+                    if ui.button("-").clicked() {
                         remove = Some(i);
                     }
                 });
