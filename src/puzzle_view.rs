@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -18,6 +18,11 @@ const FAST_MODE_MAX_FRAMES: f32 = 3.0;
 
 /// opacity of the hovered twist gizmo face.
 const GIZMO_ALPHA: f32 = 0.35;
+
+/// white outline width (physical pixels) of the shift-hovered piece.
+const HIGHLIGHT_OUTLINE_WIDTH: f32 = 12.0;
+/// white outline width (physical pixels) of selected pieces.
+const SELECTED_OUTLINE_WIDTH: f32 = 4.5;
 
 fn ease(t: f32) -> f32 {
     // cosine interpolation
@@ -89,23 +94,26 @@ pub struct PuzzleView {
     blocked_flash_duration: f32,
     /// seconds per twist animation.
     twist_duration: f32,
-    // selected_pieces: Vec<PieceId>,
+    /// indices into puzzle.pieces of the pieces selected by shift-clicking.
+    selected_pieces: HashSet<usize>,
     show_internal_stickers: bool,
     /// cull back-facing triangles. must be off to see sticker backs once
-    /// sticker_scale < 1.0 opens gaps into the pieces.
+    /// sticker_shrink < 1.0 opens gaps into the pieces.
     backface_culling: bool,
     /// scale of the whole puzzle within the rect (replaces the old MARGIN).
     puzzle_scale: f32,
     /// move pieces away from the origin; 1.0 is assembled.
     piece_explode: f32,
     /// shrink each sticker toward its own centroid; 1.0 is full size.
-    sticker_scale: f32,
+    sticker_shrink: f32,
     /// position of the puzzle center within the rect, in [-1, 1]. 0 is centered;
     /// +1 projects the center to the right / top edge (exact under orthographic).
     horizontal_align: f32,
     vertical_align: f32,
     /// sticker outline width in physical pixels; 0 disables outlines.
     outline_width: f32,
+    /// draw all gizmo faces, not just the hovered one.
+    show_gizmos: bool,
     /// shrink each twist-gizmo face toward its center; 1.0 is the full face.
     gizmo_shrink: f32,
     /// when clicking the back of a gizmo face, input the twist as seen from
@@ -124,14 +132,16 @@ impl PuzzleView {
             blocked_flash: None,
             blocked_flash_duration: 0.4,
             twist_duration: 0.15,
+            selected_pieces: HashSet::new(),
             show_internal_stickers: true,
             backface_culling: true,
             puzzle_scale: 1.0,
             piece_explode: 1.0,
-            sticker_scale: 1.0,
+            sticker_shrink: 1.0,
             horizontal_align: 0.0,
             vertical_align: 0.0,
             outline_width: 1.0,
+            show_gizmos: false,
             gizmo_shrink: 1.0,
             reverse_backface_twists: true,
             texture: None,
@@ -147,10 +157,11 @@ impl PuzzleView {
         ui.checkbox(&mut self.backface_culling, "backface culling");
         ui.add(egui::Slider::new(&mut self.puzzle_scale, 0.0..=2.0).text("puzzle scale"));
         ui.add(egui::Slider::new(&mut self.piece_explode, 1.0..=2.0).text("piece explode"));
-        ui.add(egui::Slider::new(&mut self.sticker_scale, 0.0..=1.0).text("sticker scale"));
+        ui.add(egui::Slider::new(&mut self.sticker_shrink, 0.0..=1.0).text("sticker shrink"));
         ui.add(egui::Slider::new(&mut self.horizontal_align, -1.0..=1.0).text("horizontal align"));
         ui.add(egui::Slider::new(&mut self.vertical_align, -1.0..=1.0).text("vertical align"));
         ui.add(egui::Slider::new(&mut self.outline_width, 0.0..=4.0).text("outline width"));
+        ui.checkbox(&mut self.show_gizmos, "show all gizmos");
         ui.add(egui::Slider::new(&mut self.gizmo_shrink, 0.0..=1.0).text("gizmo shrink"));
         ui.checkbox(&mut self.reverse_backface_twists, "reverse backface twists");
         ui.add(
@@ -383,18 +394,34 @@ impl PuzzleView {
         let sx = min * self.puzzle_scale / (2.0 * w as f32);
         let sy = min * self.puzzle_scale / (2.0 * h as f32);
 
+        // pointer position in clip space, if it's over the viewport.
+        let pointer_clip: Option<(f32, f32)> = if rect.width() > 0.0 && rect.height() > 0.0 {
+            response.hover_pos().map(|p| {
+                (
+                    2.0 * (p.x - rect.left()) / rect.width() - 1.0,
+                    1.0 - 2.0 * (p.y - rect.top()) / rect.height(),
+                )
+            })
+        } else {
+            None
+        };
+        // shift switches the mouse from twist input to piece selection.
+        let shift = ctx.input(|i| i.modifiers.shift);
+
         // ---- twist gizmo input ----
-        let gizmo_hover: Option<(Side, bool)> = response.hover_pos().and_then(|p| {
-            if sx.abs() < 1e-9 || sy.abs() < 1e-9 || rect.width() <= 0.0 || rect.height() <= 0.0 {
-                return None;
-            }
-            // pointer -> clip space -> the view-space orthographic ray (x, y).
-            let u = 2.0 * (p.x - rect.left()) / rect.width() - 1.0;
-            let v = 1.0 - 2.0 * (p.y - rect.top()) / rect.height();
-            let xv = (u - self.horizontal_align) / sx;
-            let yv = (v - self.vertical_align) / sy;
-            self.gizmo_hit(xv, yv)
-        });
+        let gizmo_hover: Option<(Side, bool)> = if shift {
+            None
+        } else {
+            pointer_clip.and_then(|(u, v)| {
+                if sx.abs() < 1e-9 || sy.abs() < 1e-9 {
+                    return None;
+                }
+                // clip space -> the view-space orthographic ray (x, y).
+                let xv = (u - self.horizontal_align) / sx;
+                let yv = (v - self.vertical_align) / sy;
+                self.gizmo_hit(xv, yv)
+            })
+        };
         // Handle clicks before advance_twist so the twist starts this frame.
         if let Some((side, front)) = gizmo_hover {
             // left click: CCW (like the `'` buttons); right click: CW.
@@ -456,6 +483,10 @@ impl PuzzleView {
         // pure-red copies of the blocked pieces' triangles, overlaid on top of
         // the normally-drawn scene with stylized transparency.
         let mut flash_vertices: Vec<Vertex> = Vec::new();
+        // with shift held, pick the piece under the pointer: nearest clip-space
+        // depth among the sticker triangles containing the pointer.
+        let pick_pos = if shift { pointer_clip } else { None };
+        let mut pick_best: Option<(usize, f32)> = None;
         for (piece_idx, piece) in puzzle.pieces.iter().enumerate() {
             let piece_rot = match &anim {
                 Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
@@ -482,7 +513,7 @@ impl PuzzleView {
                     color.b() as f32 / 255.0,
                 );
 
-                // The sticker's centroid (local space) is the point sticker_scale
+                // The sticker's centroid (local space) is the point sticker_shrink
                 // shrinks it toward. A sticker with no vertices draws nothing.
                 let s_centroid = sticker.centroid().unwrap();
 
@@ -490,10 +521,21 @@ impl PuzzleView {
                     .verts
                     .iter()
                     .map(|&v| {
-                        let scaled = s_centroid + (v - s_centroid) * self.sticker_scale;
+                        let scaled = s_centroid + (v - s_centroid) * self.sticker_shrink;
                         self.project(piece_rot * scaled + explode, sx, sy)
                     })
                     .collect();
+                if let Some((u, v)) = pick_pos {
+                    for i in 1..clip.len().saturating_sub(1) {
+                        if let Some(z) =
+                            bary_z(clip[0], clip[i], clip[i + 1], u, v, self.backface_culling)
+                            && pick_best.is_none_or(|(_, best_z)| z < best_z)
+                        {
+                            pick_best = Some((piece_idx, z));
+                        }
+                    }
+                }
+
                 push_fan(&mut vertices, &clip, rgb, w, h);
                 if flashed {
                     const RED: (f32, f32, f32) = (1.0, 0.0, 0.0);
@@ -502,15 +544,97 @@ impl PuzzleView {
             }
         }
 
+        // shift-click toggles the hovered piece's membership in the selection;
+        // shift-clicking the background clears the selection.
+        let hovered_piece = pick_best.map(|(piece_idx, _)| piece_idx);
+        if shift && response.clicked() {
+            match hovered_piece {
+                Some(piece_idx) => {
+                    if !self.selected_pieces.remove(&piece_idx) {
+                        self.selected_pieces.insert(piece_idx);
+                    }
+                }
+                None => self.selected_pieces.clear(),
+            }
+        }
+
+        let sticker_pipeline = StickerPipeline {
+            outline_width: self.outline_width,
+        };
         let mut color_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
         let mut depth_buf = Buffer2d::new([w, h], 1.0f32);
         rasterize(
+            &sticker_pipeline,
             &vertices,
             &mut color_buf,
             &mut depth_buf,
             self.backface_culling,
-            self.outline_width,
         );
+
+        // White outline overlays: thin for selected pieces, thick for the
+        // shift-hovered piece. On top of normal pieces, but drawn before (so
+        // under) the blocked flash and the gizmos.
+        if hovered_piece.is_some() || !self.selected_pieces.is_empty() {
+            let emit_piece_outline = |piece_idx: usize, out: &mut Vec<Vertex>| {
+                let piece = &puzzle.pieces[piece_idx];
+                let piece_rot = match &anim {
+                    Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
+                    _ => piece.rot,
+                };
+                let explode = (piece_rot * piece.explode_dir()) * (self.piece_explode - 1.0);
+                for sticker in &piece.stickers {
+                    if !(self.show_internal_stickers || sticker.side.is_some()) {
+                        continue;
+                    }
+                    let s_centroid = sticker.centroid().unwrap();
+                    let clip: Vec<[f32; 4]> = sticker
+                        .verts
+                        .iter()
+                        .map(|&v| {
+                            let scaled = s_centroid + (v - s_centroid) * self.sticker_shrink;
+                            self.project(piece_rot * scaled + explode, sx, sy)
+                        })
+                        .collect();
+                    push_fan(out, &clip, (1.0, 1.0, 1.0), w, h);
+                }
+            };
+
+            let mut outline_alpha = Buffer2d::new([w, h], 0.0f32);
+            if !self.selected_pieces.is_empty() {
+                let mut outline_vertices: Vec<Vertex> = Vec::new();
+                for &piece_idx in &self.selected_pieces {
+                    emit_piece_outline(piece_idx, &mut outline_vertices);
+                }
+                depth_buf.clear(1.0);
+                rasterize(
+                    &OutlinePipeline {
+                        width: SELECTED_OUTLINE_WIDTH,
+                    },
+                    &outline_vertices,
+                    &mut outline_alpha,
+                    &mut depth_buf,
+                    self.backface_culling,
+                );
+                blend_outline(&mut color_buf, &outline_alpha);
+            }
+            if let Some(piece_idx) = hovered_piece {
+                let mut outline_vertices: Vec<Vertex> = Vec::new();
+                emit_piece_outline(piece_idx, &mut outline_vertices);
+                outline_alpha.clear(0.0);
+                depth_buf.clear(1.0);
+                rasterize(
+                    &OutlinePipeline {
+                        width: HIGHLIGHT_OUTLINE_WIDTH,
+                    },
+                    &outline_vertices,
+                    &mut outline_alpha,
+                    &mut depth_buf,
+                    self.backface_culling,
+                );
+                blend_outline(&mut color_buf, &outline_alpha);
+            }
+        }
+
         if let Some((_, strength)) = &flash
             && !flash_vertices.is_empty()
         {
@@ -520,46 +644,60 @@ impl PuzzleView {
             let base = color_buf.as_ref().to_vec();
             depth_buf.clear(1.0);
             rasterize(
+                &sticker_pipeline,
                 &flash_vertices,
                 &mut color_buf,
                 &mut depth_buf,
                 self.backface_culling,
-                self.outline_width,
             );
             blend_layers(&base, &mut color_buf, *strength);
         }
 
-        // Hovered twist gizmo: transparent blue on top of everything, or red
-        // if the twist it inputs is currently blocked.
-        if let Some((side, _front)) = gizmo_hover {
-            let blocked = puzzle
-                .twist_pieces(Twist {
-                    side,
-                    layer,
-                    multiplicity: 1,
-                })
-                .is_err();
-            let rgb = if blocked {
-                (1.0, 0.0, 0.0)
-            } else {
-                (0.3, 0.5, 1.0)
-            };
-            let clip: Vec<[f32; 4]> = self
-                .gizmo_quad(side)
-                .iter()
-                .map(|&v| self.project(v, sx, sy))
-                .collect();
+        // Twist gizmos: transparent blue on top of everything, or red where
+        // the twist a face inputs is currently blocked. Normally only the
+        // hovered face is drawn; show_gizmos draws all of them, with the
+        // unhovered ones dimmed.
+        let gizmo_faces: Vec<Side> = if self.show_gizmos {
+            Side::ALL.to_vec()
+        } else {
+            gizmo_hover.iter().map(|&(side, _)| side).collect()
+        };
+        if !gizmo_faces.is_empty() {
             let mut gizmo_vertices: Vec<Vertex> = Vec::new();
-            push_fan(&mut gizmo_vertices, &clip, rgb, w, h);
+            for side in gizmo_faces {
+                let blocked = puzzle
+                    .twist_pieces(Twist {
+                        side,
+                        layer,
+                        multiplicity: 1,
+                    })
+                    .is_err();
+                let mut rgb = if blocked {
+                    (1.0, 0.0, 0.0)
+                } else {
+                    (0.3, 0.5, 1.0)
+                };
+                let hovered = gizmo_hover.is_some_and(|(s, _)| s == side);
+                if !hovered {
+                    const DIM: f32 = 0.4;
+                    rgb = (rgb.0 * DIM, rgb.1 * DIM, rgb.2 * DIM);
+                }
+                let clip: Vec<[f32; 4]> = self
+                    .gizmo_quad(side)
+                    .iter()
+                    .map(|&v| self.project(v, sx, sy))
+                    .collect();
+                push_fan(&mut gizmo_vertices, &clip, rgb, w, h);
+            }
             let base = color_buf.as_ref().to_vec();
             depth_buf.clear(1.0);
-            // never cull the gizmo: its backfaces are visible and clickable.
+            // never cull the gizmos: their backfaces are visible and clickable.
             rasterize(
+                &sticker_pipeline,
                 &gizmo_vertices,
                 &mut color_buf,
                 &mut depth_buf,
                 false,
-                self.outline_width,
             );
             blend_layers(&base, &mut color_buf, GIZMO_ALPHA);
         }
@@ -643,14 +781,75 @@ fn blend_layers(base: &[egui::Color32], over: &mut Buffer2d<egui::Color32>, alph
     }
 }
 
-fn rasterize(
+/// renders only sticker outlines: the pixel is the white-outline coverage in
+/// [0, 1], 0 in the sticker interior. composited by `blend_outline`, so the
+/// interior leaves the frame untouched.
+struct OutlinePipeline {
+    /// outline width in physical pixels.
+    width: f32,
+}
+impl Pipeline for OutlinePipeline {
+    type Vertex = Vertex;
+    type VsOut = ((f32, f32, f32), (f32, f32, f32));
+    type Pixel = f32;
+
+    #[inline(always)]
+    fn vert(&self, (pos, vs_out): &Self::Vertex) -> ([f32; 4], Self::VsOut) {
+        (*pos, *vs_out)
+    }
+
+    #[inline(always)]
+    fn frag(&self, ((_r, _g, _b), (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
+        let d = ea.min(*eb).min(*ec);
+        (self.width + 0.5 - d).clamp(0.0, 1.0)
+    }
+}
+
+/// composite a white outline coverage buffer over the frame.
+fn blend_outline(color_buf: &mut Buffer2d<egui::Color32>, alpha: &Buffer2d<f32>) {
+    for (c, &a) in color_buf.as_mut().iter_mut().zip(alpha.as_ref().iter()) {
+        if a > 0.0 {
+            let lerp = |x: u8| ((1.0 - a) * x as f32 + a * 255.0).round() as u8;
+            *c = egui::Color32::from_rgba_premultiplied(
+                lerp(c.r()),
+                lerp(c.g()),
+                lerp(c.b()),
+                lerp(c.a()),
+            );
+        }
+    }
+}
+
+/// depth of clip-space point (u, v) inside the clip-space triangle (a, b, c),
+/// or None if it's outside. `cull_backface` rejects back-facing (negative
+/// signed area) triangles, matching euc's backface culling so hidden faces
+/// aren't pickable when they aren't drawn.
+fn bary_z(
+    a: [f32; 4],
+    b: [f32; 4],
+    c: [f32; 4],
+    u: f32,
+    v: f32,
+    cull_backface: bool,
+) -> Option<f32> {
+    // 2x the triangle's signed area; euc culls where this is negative.
+    let denom = (b[1] - c[1]) * (a[0] - c[0]) + (c[0] - b[0]) * (a[1] - c[1]);
+    if denom.abs() < 1e-12 || (cull_backface && denom < 0.0) {
+        return None;
+    }
+    let wa = ((b[1] - c[1]) * (u - c[0]) + (c[0] - b[0]) * (v - c[1])) / denom;
+    let wb = ((c[1] - a[1]) * (u - c[0]) + (a[0] - c[0]) * (v - c[1])) / denom;
+    let wc = 1.0 - wa - wb;
+    (wa >= 0.0 && wb >= 0.0 && wc >= 0.0).then(|| wa * a[2] + wb * b[2] + wc * c[2])
+}
+
+fn rasterize<P: Pipeline<Vertex = Vertex>>(
+    pipeline: &P,
     vertices: &[Vertex],
-    color_buf: &mut Buffer2d<egui::Color32>,
+    color_buf: &mut Buffer2d<P::Pixel>,
     depth_buf: &mut Buffer2d<f32>,
     backface_culling: bool,
-    outline_width: f32,
 ) {
-    let pipeline = StickerPipeline { outline_width };
     if backface_culling {
         pipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingEnabled>, _>(
             vertices,

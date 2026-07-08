@@ -11,12 +11,15 @@
 - fmc timeline
     - operations twist, macro, fork, niss, mark/comment
     - fork is how you search different paths
-- rendering: gpu / outlines
+- rendering: gpu / outlines / lighting
 - thing to derive a subpuzzle by deleting pieces
-- twist gizmos
-- twist gizmos should show what twists are blocked, without needing to fail a twist
-- on a failed twist, red flash the blocked pieces. red flashing pieces are drawn on top of the others. like hactars stylized opacity. also red flash should have a fade animation. maybe grey out or semitransparent the non blocking pieces.
 - refl puzzles
+- bug: doing several twists accumulates error and makes it block incorrectly. use approx_collections
+- blocked red flash should also flash the plane that contains the blocked pieces.
+- make "show gizmos" mode look better. outlines? better colors?
+- maybe gizmos should be at the cut depth, not at the faces.
+- make "hovered / selected pieces" look better. thicker outlines? outlines are opaque to the piece they're from, but not the other pieces, which is a bit weird. shouldn't be the same color as U, maybe change to light gray, or maybe lighting will help. clicking a piece should have an immediate visual effect.
+- selected piece sets
 - if you do too many blocked moves in a row, offer to switch to an easier puzzle, maybe sun cube ultimate.
 - stickerings: super, center compass, edge vs corner triangle distinguishable.
 - latched, bandaging pieces, gear
