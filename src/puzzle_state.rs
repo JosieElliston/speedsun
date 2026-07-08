@@ -10,7 +10,7 @@ const ROT_ID: Rot = Rot::new(1.0, 0.0, 0.0, 0.0);
 // TODO: factor usage of Plane into a struct
 // struct Plane
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Side {
     R,
     L,
@@ -112,6 +112,24 @@ impl Piece {
             }
         }
         (count > 0.0).then(|| sum / count)
+    }
+
+    /// direction the piece moves when exploded: the sum of the distinct face
+    /// normals of its colored stickers, in the piece's local frame. In
+    /// cubeshape this keeps each side's stickers coplanar as the puzzle
+    /// explodes (every piece on a side is displaced by the same amount along
+    /// that side's normal), unlike a centroid-based direction.
+    pub fn explode_dir(&self) -> Vec3 {
+        Side::ALL
+            .into_iter()
+            .filter_map(|side| {
+                if self.stickers.iter().any(|s| s.side == Some(side)) {
+                    Some(side.plane())
+                } else {
+                    None
+                }
+            })
+            .sum()
     }
 
     fn full_cube() -> Self {

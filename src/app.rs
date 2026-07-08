@@ -63,7 +63,8 @@ impl eframe::App for App {
                 self.puzzle_view.drag(drag, SENSITIVITY);
             }
 
-            self.puzzle_view.draw(&ui.painter_at(rect), Instant::now());
+            self.puzzle_view
+                .draw(&ui.painter_at(rect), &response, self.layer, Instant::now());
         });
     }
 }

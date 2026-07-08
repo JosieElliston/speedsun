@@ -4,7 +4,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cgmath::{Rotation, Rotation3};
+use cgmath::{InnerSpace, Rotation, Rotation3};
 use eframe::egui::{self, mutex::Mutex};
 use euc::{Pipeline, Target, buffer::Buffer2d, rasterizer};
 
@@ -15,6 +15,9 @@ use crate::puzzle_state::*;
 /// the intermediate fractions are deterministic and dt jitter can neither skip
 /// a twist's animation entirely nor change which fraction gets shown.
 const FAST_MODE_MAX_FRAMES: f32 = 3.0;
+
+/// opacity of the hovered twist gizmo face.
+const GIZMO_ALPHA: f32 = 0.35;
 
 fn ease(t: f32) -> f32 {
     // cosine interpolation
@@ -103,6 +106,11 @@ pub struct PuzzleView {
     vertical_align: f32,
     /// sticker outline width in physical pixels; 0 disables outlines.
     outline_width: f32,
+    /// shrink each twist-gizmo face toward its center; 1.0 is the full face.
+    gizmo_shrink: f32,
+    /// when clicking the back of a gizmo face, input the twist as seen from
+    /// the camera (mirrored) instead of as defined from outside the face.
+    reverse_backface_twists: bool,
     /// the software-rendered frame, re-uploaded to the GPU each draw.
     texture: Option<egui::TextureHandle>,
 }
@@ -124,6 +132,8 @@ impl PuzzleView {
             horizontal_align: 0.0,
             vertical_align: 0.0,
             outline_width: 1.0,
+            gizmo_shrink: 1.0,
+            reverse_backface_twists: true,
             texture: None,
         }
     }
@@ -136,11 +146,13 @@ impl PuzzleView {
         ui.checkbox(&mut self.show_internal_stickers, "internal stickers");
         ui.checkbox(&mut self.backface_culling, "backface culling");
         ui.add(egui::Slider::new(&mut self.puzzle_scale, 0.0..=2.0).text("puzzle scale"));
-        ui.add(egui::Slider::new(&mut self.piece_explode, 1.0..=3.0).text("piece explode"));
+        ui.add(egui::Slider::new(&mut self.piece_explode, 1.0..=2.0).text("piece explode"));
         ui.add(egui::Slider::new(&mut self.sticker_scale, 0.0..=1.0).text("sticker scale"));
         ui.add(egui::Slider::new(&mut self.horizontal_align, -1.0..=1.0).text("horizontal align"));
         ui.add(egui::Slider::new(&mut self.vertical_align, -1.0..=1.0).text("vertical align"));
         ui.add(egui::Slider::new(&mut self.outline_width, 0.0..=4.0).text("outline width"));
+        ui.add(egui::Slider::new(&mut self.gizmo_shrink, 0.0..=1.0).text("gizmo shrink"));
+        ui.checkbox(&mut self.reverse_backface_twists, "reverse backface twists");
         ui.add(
             egui::Slider::new(&mut self.twist_duration, 0.01..=1.0)
                 .logarithmic(true)
@@ -255,6 +267,75 @@ impl PuzzleView {
         }
     }
 
+    /// one face of the uncut cube, used as a twist-input gizmo. The exploded
+    /// puzzle (in cubeshape) is bounded by the cube scaled to
+    /// [-piece_explode, piece_explode]^3, so the whole face scales with it;
+    /// gizmo_shrink then shrinks the face toward its center.
+    fn gizmo_quad(&self, side: Side) -> [Vec3; 4] {
+        let n = side.plane();
+        let t1 = if n.x.abs() > 0.5 {
+            Vec3::unit_y()
+        } else {
+            Vec3::unit_x()
+        };
+        let t2 = if n.z.abs() > 0.5 {
+            Vec3::unit_y()
+        } else {
+            Vec3::unit_z()
+        };
+        let c = n * self.piece_explode;
+        let s = self.piece_explode * self.gizmo_shrink;
+        [
+            c + (t1 + t2) * s,
+            c + (-t1 + t2) * s,
+            c + (-t1 - t2) * s,
+            c + (t1 - t2) * s,
+        ]
+    }
+
+    /// hit-test the pointer (at view-space ray coordinates `xv`, `yv`) against
+    /// the gizmo faces. returns the nearest hit face and whether its front
+    /// (outward) side faces the camera.
+    fn gizmo_hit(&self, xv: f32, yv: f32) -> Option<(Side, bool)> {
+        let mut best: Option<(Side, bool, f32)> = None;
+        for side in Side::ALL {
+            let vs = self.gizmo_quad(side).map(|q| self.rot.rotate_vector(q));
+            // 2D point-in-convex-quad, accepting either winding.
+            let mut sign = 0.0f32;
+            let mut inside = true;
+            for i in 0..4 {
+                let a = vs[i];
+                let b = vs[(i + 1) % 4];
+                let cross = (b.x - a.x) * (yv - a.y) - (b.y - a.y) * (xv - a.x);
+                if cross == 0.0 {
+                    continue;
+                }
+                if sign == 0.0 {
+                    sign = cross.signum();
+                } else if cross.signum() != sign {
+                    inside = false;
+                    break;
+                }
+            }
+            if !inside {
+                continue;
+            }
+            let n = self.rot.rotate_vector(side.plane());
+            if n.z.abs() < 1e-6 {
+                // edge-on
+                continue;
+            }
+            // view-space z where the orthographic ray meets the face plane;
+            // larger z is nearer to the camera.
+            let z = (n.dot(vs[0]) - n.x * xv - n.y * yv) / n.z;
+            let front = n.z > 0.0;
+            if best.is_none_or(|(_, _, best_z)| z > best_z) {
+                best = Some((side, front, z));
+            }
+        }
+        best.map(|(side, front, _)| (side, front))
+    }
+
     /// Project a puzzle-space point to clip space (`[x, y, z, w]`, orthographic so
     /// `w = 1`): apply the view rotation and alignment, and map z to a normalized
     /// depth where smaller means nearer, matching `euc`'s `IfLessWrite` test.
@@ -272,7 +353,13 @@ impl PuzzleView {
         ]
     }
 
-    pub fn draw(&mut self, painter: &egui::Painter, now: Instant) {
+    pub fn draw(
+        &mut self,
+        painter: &egui::Painter,
+        response: &egui::Response,
+        layer: u8,
+        now: Instant,
+    ) {
         // Clone the Arc so the lock guard doesn't borrow self (advance_twist
         // needs &mut self while the puzzle is locked).
         let puzzle = Arc::clone(&self.puzzle);
@@ -281,13 +368,62 @@ impl PuzzleView {
         let rect = painter.clip_rect();
         let ctx = painter.ctx();
 
+        // Render into a buffer sized in physical pixels so the result is crisp
+        // regardless of the display's scale factor.
+        let ppp = ctx.pixels_per_point();
+        // at least 1: euc divides by the buffer size, and egui can hand out a
+        // transiently empty rect mid-resize.
+        let w = ((rect.width() * ppp).round() as usize).max(1);
+        let h = ((rect.height() * ppp).round() as usize).max(1);
+
+        // The puzzle is rendered orthographically. `sx`/`sy` scale world units to
+        // NDC, keeping the puzzle square in a non-square viewport (matching the
+        // old `size().min_elem()` behavior).
+        let min = w.min(h) as f32;
+        let sx = min * self.puzzle_scale / (2.0 * w as f32);
+        let sy = min * self.puzzle_scale / (2.0 * h as f32);
+
+        // ---- twist gizmo input ----
+        let gizmo_hover: Option<(Side, bool)> = response.hover_pos().and_then(|p| {
+            if sx.abs() < 1e-9 || sy.abs() < 1e-9 || rect.width() <= 0.0 || rect.height() <= 0.0 {
+                return None;
+            }
+            // pointer -> clip space -> the view-space orthographic ray (x, y).
+            let u = 2.0 * (p.x - rect.left()) / rect.width() - 1.0;
+            let v = 1.0 - 2.0 * (p.y - rect.top()) / rect.height();
+            let xv = (u - self.horizontal_align) / sx;
+            let yv = (v - self.vertical_align) / sy;
+            self.gizmo_hit(xv, yv)
+        });
+        // Handle clicks before advance_twist so the twist starts this frame.
+        if let Some((side, front)) = gizmo_hover {
+            // left click: CCW (like the `'` buttons); right click: CW.
+            let multiplicity = if response.clicked() {
+                Some(-1)
+            } else if response.secondary_clicked() {
+                Some(1)
+            } else {
+                None
+            };
+            if let Some(mut multiplicity) = multiplicity {
+                if !front && self.reverse_backface_twists {
+                    multiplicity = -multiplicity;
+                }
+                self.push_twist(Twist {
+                    side,
+                    layer,
+                    multiplicity,
+                });
+            }
+        }
+
         let stable_dt = ctx.input(|i| i.stable_dt);
         self.advance_twist(&mut puzzle, now, stable_dt);
 
-        if let Some(flash) = &self.blocked_flash {
-            if flash.strength(now, self.blocked_flash_duration) <= 0.0 {
-                self.blocked_flash = None;
-            }
+        if let Some(flash) = &self.blocked_flash
+            && flash.strength(now, self.blocked_flash_duration) <= 0.0
+        {
+            self.blocked_flash = None;
         }
         // Red tint mask for the pieces that blocked a rejected twist.
         let flash: Option<(Vec<bool>, f32)> = self.blocked_flash.as_ref().map(|flash| {
@@ -312,19 +448,6 @@ impl PuzzleView {
             (mask, rot)
         });
 
-        // Render into a buffer sized in physical pixels so the result is crisp
-        // regardless of the display's scale factor.
-        let ppp = ctx.pixels_per_point();
-        let w = ((rect.width() * ppp).round() as usize).clamp(1, 4096);
-        let h = ((rect.height() * ppp).round() as usize).clamp(1, 4096);
-
-        // The puzzle is rendered orthographically. `sx`/`sy` scale world units to
-        // NDC, keeping the puzzle square in a non-square viewport (matching the
-        // old `size().min_elem()` behavior).
-        let min = w.min(h) as f32;
-        let sx = min * self.puzzle_scale / (2.0 * w as f32);
-        let sy = min * self.puzzle_scale / (2.0 * h as f32);
-
         // Correct visibility needs a per-pixel depth buffer, not a per-sticker
         // depth sort: sorting can't resolve interpenetrating or cyclically
         // overlapping polygons. We rasterize every sticker triangle on the CPU
@@ -340,11 +463,11 @@ impl PuzzleView {
             };
             let flashed = matches!(&flash, Some((mask, _)) if mask[piece_idx]);
 
-            // The piece's centroid (puzzle space, before the view rotation) is
-            // the direction it explodes along. A piece with no vertices has
-            // nothing to draw.
-            let piece_centroid = piece.centroid().unwrap();
-            let explode = (piece_rot * piece_centroid) * (self.piece_explode - 1.0);
+            // Explode moves each piece along the sum of its colored stickers'
+            // face normals (rotated to the current orientation), which in
+            // cubeshape keeps each side's stickers coplanar as the puzzle
+            // explodes.
+            let explode = (piece_rot * piece.explode_dir()) * (self.piece_explode - 1.0);
 
             for sticker in &piece.stickers {
                 if !(self.show_internal_stickers || sticker.side.is_some()) {
@@ -388,38 +511,57 @@ impl PuzzleView {
             self.backface_culling,
             self.outline_width,
         );
-        if let Some((_, strength)) = &flash {
-            if !flash_vertices.is_empty() {
-                // Stylized transparency, as in
-                // https://ajfarkas.dev/blog/hsc2-transparency/: render the red
-                // overlay opaquely into a copy of the frame, then blend
-                // output = (1 - s) * base + s * overlay. Per pixel only the
-                // nearest red surface shows, with no fog-like
-                // transparent-on-transparent buildup. The fresh depth buffer
-                // puts the red on top of all normal geometry (it still
-                // self-occludes, though that's invisible in a solid color).
-                // The convex combination is also correct for premultiplied
-                // alpha, so the overlay works over the transparent background.
-                let base = color_buf.as_ref().to_vec();
-                depth_buf.clear(1.0);
-                rasterize(
-                    &flash_vertices,
-                    &mut color_buf,
-                    &mut depth_buf,
-                    self.backface_culling,
-                    self.outline_width,
-                );
-                let s = *strength;
-                let lerp = |b: u8, o: u8| ((1.0 - s) * b as f32 + s * o as f32).round() as u8;
-                for (over, base) in color_buf.as_mut().iter_mut().zip(&base) {
-                    *over = egui::Color32::from_rgba_premultiplied(
-                        lerp(base.r(), over.r()),
-                        lerp(base.g(), over.g()),
-                        lerp(base.b(), over.b()),
-                        lerp(base.a(), over.a()),
-                    );
-                }
-            }
+        if let Some((_, strength)) = &flash
+            && !flash_vertices.is_empty()
+        {
+            // The fresh depth buffer puts the red on top of all normal
+            // geometry (it still self-occludes, though that's invisible in
+            // a solid color).
+            let base = color_buf.as_ref().to_vec();
+            depth_buf.clear(1.0);
+            rasterize(
+                &flash_vertices,
+                &mut color_buf,
+                &mut depth_buf,
+                self.backface_culling,
+                self.outline_width,
+            );
+            blend_layers(&base, &mut color_buf, *strength);
+        }
+
+        // Hovered twist gizmo: transparent blue on top of everything, or red
+        // if the twist it inputs is currently blocked.
+        if let Some((side, _front)) = gizmo_hover {
+            let blocked = puzzle
+                .twist_pieces(Twist {
+                    side,
+                    layer,
+                    multiplicity: 1,
+                })
+                .is_err();
+            let rgb = if blocked {
+                (1.0, 0.0, 0.0)
+            } else {
+                (0.3, 0.5, 1.0)
+            };
+            let clip: Vec<[f32; 4]> = self
+                .gizmo_quad(side)
+                .iter()
+                .map(|&v| self.project(v, sx, sy))
+                .collect();
+            let mut gizmo_vertices: Vec<Vertex> = Vec::new();
+            push_fan(&mut gizmo_vertices, &clip, rgb, w, h);
+            let base = color_buf.as_ref().to_vec();
+            depth_buf.clear(1.0);
+            // never cull the gizmo: its backfaces are visible and clickable.
+            rasterize(
+                &gizmo_vertices,
+                &mut color_buf,
+                &mut depth_buf,
+                false,
+                self.outline_width,
+            );
+            blend_layers(&base, &mut color_buf, GIZMO_ALPHA);
         }
 
         let image = egui::ColorImage::new([w, h], color_buf.as_ref().to_vec());
@@ -449,7 +591,8 @@ fn push_fan(out: &mut Vec<Vertex>, clip: &[[f32; 4]], rgb: (f32, f32, f32), w: u
     const FAR: f32 = 1e6;
     // Distances must be measured in the same space euc rasterizes in; the
     // y-flip of its NDC->pixel map doesn't matter for distances.
-    let px = |c: &[f32; 4]| egui::vec2((c[0] + 1.0) * 0.5 * w as f32, (c[1] + 1.0) * 0.5 * h as f32);
+    let px =
+        |c: &[f32; 4]| egui::vec2((c[0] + 1.0) * 0.5 * w as f32, (c[1] + 1.0) * 0.5 * h as f32);
     let n = clip.len();
     for i in 1..n.saturating_sub(1) {
         let (a, b, c) = (clip[0], clip[i], clip[i + 1]);
@@ -467,7 +610,11 @@ fn push_fan(out: &mut Vec<Vertex>, clip: &[[f32; 4]], rgb: (f32, f32, f32), w: u
         } else {
             (FAR, FAR, FAR)
         };
-        let (e2a, e2b, e2c) = if i == 1 { (0.0, 0.0, hc) } else { (FAR, FAR, FAR) };
+        let (e2a, e2b, e2c) = if i == 1 {
+            (0.0, 0.0, hc)
+        } else {
+            (FAR, FAR, FAR)
+        };
         out.push((a, (rgb, (ha, e1a, e2a))));
         out.push((b, (rgb, (0.0, e1b, e2b))));
         out.push((c, (rgb, (0.0, e1c, e2c))));
@@ -477,6 +624,25 @@ fn push_fan(out: &mut Vec<Vertex>, clip: &[[f32; 4]], rgb: (f32, f32, f32), w: u
 /// Backface culling is a compile-time type param in euc, so branch over the
 /// two monomorphizations. All stickers are wound counterclockwise as seen
 /// from outside their piece, so back faces are the ones hidden inside.
+/// Stylized-transparency composite, as in
+/// https://ajfarkas.dev/blog/hsc2-transparency/: the overlay is rendered
+/// opaquely (so per pixel only its nearest surface shows, with no fog-like
+/// transparent-on-transparent buildup), then blended in place as
+/// `over = (1 - alpha) * base + alpha * over`. The convex combination is also
+/// correct for premultiplied alpha, so overlays work over the transparent
+/// background.
+fn blend_layers(base: &[egui::Color32], over: &mut Buffer2d<egui::Color32>, alpha: f32) {
+    let lerp = |b: u8, o: u8| ((1.0 - alpha) * b as f32 + alpha * o as f32).round() as u8;
+    for (o, b) in over.as_mut().iter_mut().zip(base) {
+        *o = egui::Color32::from_rgba_premultiplied(
+            lerp(b.r(), o.r()),
+            lerp(b.g(), o.g()),
+            lerp(b.b(), o.b()),
+            lerp(b.a(), o.a()),
+        );
+    }
+}
+
 fn rasterize(
     vertices: &[Vertex],
     color_buf: &mut Buffer2d<egui::Color32>,
