@@ -53,6 +53,19 @@ pub struct Sticker {
     /// none if it shouldn't be colored, so if it's a cut surface.
     pub side: Option<Side>,
 }
+impl Sticker {
+    /// average of the vertices (local space); `None` if there are no vertices.
+    pub fn centroid(&self) -> Option<Vec3> {
+        if self.verts.is_empty() {
+            return None;
+        }
+        let sum = self
+            .verts
+            .iter()
+            .fold(Vec3::new(0.0, 0.0, 0.0), |acc, &v| acc + v);
+        Some(sum / self.verts.len() as f32)
+    }
+}
 
 // TODO: switch `Inside` and `Outside`
 #[derive(Debug, Clone)]
@@ -87,6 +100,20 @@ pub struct Piece {
     pub rot: Rot,
 }
 impl Piece {
+    /// average of all sticker vertices (local space, before `self.rot`);
+    /// `None` for a piece with no vertices.
+    pub fn centroid(&self) -> Option<Vec3> {
+        let mut sum = Vec3::new(0.0, 0.0, 0.0);
+        let mut count = 0.0;
+        for sticker in &self.stickers {
+            for &v in &sticker.verts {
+                sum += v;
+                count += 1.0;
+            }
+        }
+        (count > 0.0).then(|| sum / count)
+    }
+
     fn full_cube() -> Self {
         let ruf = Vec3::new(1.0, 1.0, 1.0);
         let rub = Vec3::new(1.0, 1.0, -1.0);
@@ -456,7 +483,9 @@ impl PuzzleState {
         slf
     }
 
-    pub fn twist(&mut self, twist: Twist) -> Result<(), TwistError> {
+    /// which pieces a twist would rotate, without mutating.
+    /// used by the view to animate a twist before applying it.
+    pub fn twist_pieces(&self, twist: Twist) -> Result<Vec<usize>, TwistError> {
         let mut blocked = Vec::new();
         let mut inside = Vec::new();
 
@@ -493,7 +522,11 @@ impl PuzzleState {
             });
         }
 
-        for piece_idx in inside {
+        Ok(inside)
+    }
+
+    pub fn twist(&mut self, twist: Twist) -> Result<(), TwistError> {
+        for piece_idx in self.twist_pieces(twist)? {
             let piece = &mut self.pieces[piece_idx];
             let angle = -twist.multiplicity as f32 * std::f32::consts::FRAC_PI_4;
             let rot = Rot::from_axis_angle(twist.side.plane(), cgmath::Rad(angle));

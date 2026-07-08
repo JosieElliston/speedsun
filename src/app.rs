@@ -31,14 +31,14 @@ impl eframe::App for App {
             for side in Side::ALL {
                 ui.horizontal(|ui| {
                     if ui.button(format!("{side:?}'")).clicked() {
-                        let r = self.puzzle.lock().twist(Twist {
+                        self.puzzle_view.push_twist(Twist {
                             side,
                             layer: self.layer,
                             multiplicity: -1,
                         });
                     }
                     if ui.button(format!("{side:?}")).clicked() {
-                        let r = self.puzzle.lock().twist(Twist {
+                        self.puzzle_view.push_twist(Twist {
                             side,
                             layer: self.layer,
                             multiplicity: 1,

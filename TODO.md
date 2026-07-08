@@ -6,6 +6,8 @@
 - keybinds
 - macros
 - partial solve detection
+- timer
+- log files
 - fmc timeline
     - operations twist, macro, fork, niss, mark/comment
     - fork is how you search different paths
@@ -18,3 +20,4 @@
 - latched, bandaging pieces, gear
 - custom scrambler
 - chromebook support??
+- finish animation is the cube exploding/popping
