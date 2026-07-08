@@ -101,6 +101,8 @@ pub struct PuzzleView {
     /// +1 projects the center to the right / top edge (exact under orthographic).
     horizontal_align: f32,
     vertical_align: f32,
+    /// sticker outline width in physical pixels; 0 disables outlines.
+    outline_width: f32,
     /// the software-rendered frame, re-uploaded to the GPU each draw.
     texture: Option<egui::TextureHandle>,
 }
@@ -121,6 +123,7 @@ impl PuzzleView {
             sticker_scale: 1.0,
             horizontal_align: 0.0,
             vertical_align: 0.0,
+            outline_width: 1.0,
             texture: None,
         }
     }
@@ -137,6 +140,7 @@ impl PuzzleView {
         ui.add(egui::Slider::new(&mut self.sticker_scale, 0.0..=1.0).text("sticker scale"));
         ui.add(egui::Slider::new(&mut self.horizontal_align, -1.0..=1.0).text("horizontal align"));
         ui.add(egui::Slider::new(&mut self.vertical_align, -1.0..=1.0).text("vertical align"));
+        ui.add(egui::Slider::new(&mut self.outline_width, 0.0..=4.0).text("outline width"));
         ui.add(
             egui::Slider::new(&mut self.twist_duration, 0.01..=1.0)
                 .logarithmic(true)
@@ -367,19 +371,10 @@ impl PuzzleView {
                         self.project(piece_rot * scaled + explode, sx, sy)
                     })
                     .collect();
-                // Fan-triangulate the (convex) sticker polygon.
-                for i in 1..clip.len().saturating_sub(1) {
-                    vertices.push((clip[0], rgb));
-                    vertices.push((clip[i], rgb));
-                    vertices.push((clip[i + 1], rgb));
-                }
+                push_fan(&mut vertices, &clip, rgb, w, h);
                 if flashed {
                     const RED: (f32, f32, f32) = (1.0, 0.0, 0.0);
-                    for i in 1..clip.len().saturating_sub(1) {
-                        flash_vertices.push((clip[0], RED));
-                        flash_vertices.push((clip[i], RED));
-                        flash_vertices.push((clip[i + 1], RED));
-                    }
+                    push_fan(&mut flash_vertices, &clip, RED, w, h);
                 }
             }
         }
@@ -391,6 +386,7 @@ impl PuzzleView {
             &mut color_buf,
             &mut depth_buf,
             self.backface_culling,
+            self.outline_width,
         );
         if let Some((_, strength)) = &flash {
             if !flash_vertices.is_empty() {
@@ -411,6 +407,7 @@ impl PuzzleView {
                     &mut color_buf,
                     &mut depth_buf,
                     self.backface_culling,
+                    self.outline_width,
                 );
                 let s = *strength;
                 let lerp = |b: u8, o: u8| ((1.0 - s) * b as f32 + s * o as f32).round() as u8;
@@ -438,8 +435,44 @@ impl PuzzleView {
     }
 }
 
-/// A clip-space position plus an (r, g, b) color carried to the fragment stage.
-type Vertex = ([f32; 4], (f32, f32, f32));
+/// A clip-space position, plus an (r, g, b) color and per-vertex edge
+/// distances (see `push_fan`) carried to the fragment stage.
+type Vertex = ([f32; 4], ((f32, f32, f32), (f32, f32, f32)));
+
+/// Fan-triangulate a convex clip-space polygon into `out`, attaching edge
+/// attributes for outline drawing: component k, interpolated across the
+/// triangle, is the pixel-space distance to the triangle edge opposite vertex
+/// k — but only where that edge is a boundary edge of the polygon. Interior
+/// fan diagonals get a huge constant instead so they never darken.
+fn push_fan(out: &mut Vec<Vertex>, clip: &[[f32; 4]], rgb: (f32, f32, f32), w: usize, h: usize) {
+    /// far enough that outline shading never triggers.
+    const FAR: f32 = 1e6;
+    // Distances must be measured in the same space euc rasterizes in; the
+    // y-flip of its NDC->pixel map doesn't matter for distances.
+    let px = |c: &[f32; 4]| egui::vec2((c[0] + 1.0) * 0.5 * w as f32, (c[1] + 1.0) * 0.5 * h as f32);
+    let n = clip.len();
+    for i in 1..n.saturating_sub(1) {
+        let (a, b, c) = (clip[0], clip[i], clip[i + 1]);
+        let (pa, pb, pc) = (px(&a), px(&b), px(&c));
+        let (ab, ac, bc) = (pb - pa, pc - pa, pc - pb);
+        let area2 = (ab.x * ac.y - ab.y * ac.x).abs();
+        // Vertex-to-opposite-edge heights in pixels.
+        let ha = area2 / bc.length().max(1e-6);
+        let hb = area2 / ac.length().max(1e-6);
+        let hc = area2 / ab.length().max(1e-6);
+        // Triangle edge (b, c) is always a polygon boundary edge; (a, b) only
+        // in the first fan triangle, (a, c) only in the last.
+        let (e1a, e1b, e1c) = if i + 1 == n - 1 {
+            (0.0, hb, 0.0)
+        } else {
+            (FAR, FAR, FAR)
+        };
+        let (e2a, e2b, e2c) = if i == 1 { (0.0, 0.0, hc) } else { (FAR, FAR, FAR) };
+        out.push((a, (rgb, (ha, e1a, e2a))));
+        out.push((b, (rgb, (0.0, e1b, e2b))));
+        out.push((c, (rgb, (0.0, e1c, e2c))));
+    }
+}
 
 /// Backface culling is a compile-time type param in euc, so branch over the
 /// two monomorphizations. All stickers are wound counterclockwise as seen
@@ -449,15 +482,17 @@ fn rasterize(
     color_buf: &mut Buffer2d<egui::Color32>,
     depth_buf: &mut Buffer2d<f32>,
     backface_culling: bool,
+    outline_width: f32,
 ) {
+    let pipeline = StickerPipeline { outline_width };
     if backface_culling {
-        StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingEnabled>, _>(
+        pipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingEnabled>, _>(
             vertices,
             color_buf,
             Some(depth_buf),
         );
     } else {
-        StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
+        pipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
             vertices,
             color_buf,
             Some(depth_buf),
@@ -467,19 +502,34 @@ fn rasterize(
 
 /// CPU rasterization pipeline for the flat-shaded stickers. Depth testing uses
 /// `euc`'s default `IfLessWrite` strategy against the depth buffer.
-struct StickerPipeline;
+struct StickerPipeline {
+    /// outline width in physical pixels; 0 disables outlines.
+    outline_width: f32,
+}
 impl Pipeline for StickerPipeline {
     type Vertex = Vertex;
-    type VsOut = (f32, f32, f32);
+    type VsOut = ((f32, f32, f32), (f32, f32, f32));
     type Pixel = egui::Color32;
 
     #[inline(always)]
-    fn vert(&self, (pos, rgb): &Self::Vertex) -> ([f32; 4], Self::VsOut) {
-        (*pos, *rgb)
+    fn vert(&self, (pos, vs_out): &Self::Vertex) -> ([f32; 4], Self::VsOut) {
+        (*pos, *vs_out)
     }
 
     #[inline(always)]
-    fn frag(&self, (r, g, b): &Self::VsOut) -> Self::Pixel {
-        egui::Color32::from_rgb((r * 255.0) as u8, (g * 255.0) as u8, (b * 255.0) as u8)
+    fn frag(&self, ((r, g, b), (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
+        // Pixel distance to the nearest polygon boundary edge; darken within
+        // outline_width of it, antialiased over one pixel.
+        let t = if self.outline_width > 0.0 {
+            let d = ea.min(*eb).min(*ec);
+            (d - self.outline_width + 0.5).clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        egui::Color32::from_rgb(
+            (r * t * 255.0) as u8,
+            (g * t * 255.0) as u8,
+            (b * t * 255.0) as u8,
+        )
     }
 }

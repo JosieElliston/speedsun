@@ -13,6 +13,7 @@
     - fork is how you search different paths
 - rendering: gpu / outlines
 - thing to derive a subpuzzle by deleting pieces
+- twist gizmos
 - twist gizmos should show what twists are blocked, without needing to fail a twist
 - on a failed twist, red flash the blocked pieces. red flashing pieces are drawn on top of the others. like hactars stylized opacity. also red flash should have a fade animation. maybe grey out or semitransparent the non blocking pieces.
 - refl puzzles
