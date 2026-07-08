@@ -160,20 +160,26 @@ impl PieceSetTerm {
         self.must_have.iter().all(has) && !self.cant_have.iter().any(has)
     }
 
-    /// milo-syntax-ish summary, e.g. "RU!F".
+    /// milo-syntax-ish summary, e.g. "RU!FL".
     fn label(&self) -> String {
-        let mut s = String::new();
+        let mut must_have = String::new();
         for side in Side::ALL {
             if self.must_have.contains(&side) {
-                s.push_str(&format!("{side:?}"));
+                must_have.push_str(&format!("{side:?}"));
             }
         }
+        let mut cant_have = String::new();
         for side in Side::ALL {
             if self.cant_have.contains(&side) {
-                s.push_str(&format!("!{side:?}"));
+                cant_have.push_str(&format!("{side:?}"));
             }
         }
-        if s.is_empty() { "all".to_string() } else { s }
+        match (must_have.is_empty(), cant_have.is_empty()) {
+            (true, true) => "all".to_string(),
+            (false, true) => must_have,
+            (true, false) => format!("!{cant_have}"),
+            (false, false) => format!("{must_have}!{cant_have}"),
+        }
     }
 }
 
@@ -280,7 +286,6 @@ struct Sequence {
     /// (and finally to `CompleteStyle::DEFAULT`).
     fallback: BoxPartialStyle,
     stages: Vec<Stage>,
-    stage_idx: usize,
 }
 impl Sequence {
     fn new(name: String) -> Self {
@@ -288,7 +293,6 @@ impl Sequence {
             name,
             fallback: BoxPartialStyle::Literal(PartialStyle::NONE),
             stages: vec![Stage::new("stage 0".to_string())],
-            stage_idx: 0,
         }
     }
 
@@ -333,22 +337,39 @@ pub struct Filters {
     shared_styles: Vec<Rc<RefCell<SharedStyle>>>,
     sequences: Vec<Sequence>,
     sequence_idx: usize,
+    stage_idx: usize,
 }
 impl Filters {
     // TODO: bake the prev stage search into the stage to make this constant time
     // (rather than linear) (in the number of stages) (it'll still be linear in the number of terms).
     pub fn style_of(&self, piece: &Piece) -> CompleteStyle {
-        let seq = &self.sequences[self.sequence_idx];
-        let stage = &seq.stages[seq.stage_idx];
+        let seq = &self.selected_sequence();
+        let stage = &seq.stages[self.stage_idx];
         // unmatched pieces (and fields a matched style leaves unset) fall
         // through the stage fallback, then the sequence fallback, then the
         // hardcoded default.
         let fallback = stage.fallback.resolve().or(&seq.fallback.resolve());
-        match seq.get_no_fallback(piece, seq.stage_idx) {
+        match seq.get_no_fallback(piece, self.stage_idx) {
             None => fallback,
             Some(style) => style.or(&fallback),
         }
         .unwrap_or(&CompleteStyle::DEFAULT)
+    }
+
+    fn selected_sequence(&self) -> &Sequence {
+        &self.sequences[self.sequence_idx]
+    }
+
+    fn selected_sequence_mut(&mut self) -> &mut Sequence {
+        &mut self.sequences[self.sequence_idx]
+    }
+
+    fn selected_stage(&self) -> &Stage {
+        &self.sequences[self.sequence_idx].stages[self.stage_idx]
+    }
+
+    fn selected_stage_mut(&mut self) -> &mut Stage {
+        &mut self.sequences[self.sequence_idx].stages[self.stage_idx]
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -365,112 +386,100 @@ impl Filters {
     fn ui_sequences(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.strong("sequences");
-            if ui
-                .button("+")
-                .on_hover_text("insert a new sequence after the selected one")
-                .clicked()
-            {
-                let i = self.sequence_idx + 1;
-                self.sequences.insert(
-                    i,
-                    Sequence::new(format!("sequence {}", self.sequences.len())),
-                );
-                self.sequence_idx = i;
-            }
         });
 
-        let sequence_idx = self.sequence_idx;
         let n_seqs = self.sequences.len();
-        let mut select_seq = None;
+        // let mut select_seq_stage: Option<(usize, usize)> = None;
         let mut remove_seq = None;
-        // (sequence, position): insert a copy of the selected stage there.
-        let mut insert_stage = None;
-        for (i, seq) in self.sequences.iter_mut().enumerate() {
-            ui.push_id(("sequence", i), |ui| {
+        // let mut remove_stage: Option<(usize, usize)> = None;
+        let mut append_stage: Option<usize> = None;
+        for (seq_idx, seq) in self.sequences.iter_mut().enumerate() {
+            ui.push_id(("sequence", seq_idx), |ui| {
                 let state = CollapsingState::load_with_default_open(
                     ui.ctx(),
                     ui.make_persistent_id("sequence"),
                     true,
                 );
                 let header = state.show_header(ui, |ui| {
-                    if name_button(ui, &mut seq.name, i == sequence_idx) {
-                        select_seq = Some(i);
+                    if name_button(ui, &mut seq.name, seq_idx == self.sequence_idx) {
+                        // select_seq_stage = Some((seq_idx, 0));
+                        self.sequence_idx = seq_idx;
+                        self.stage_idx = 0;
                     }
                     if n_seqs > 1
                         && ui
-                            .button("-")
-                            .on_hover_text("delete this sequence")
+                            .button("🗑️")
+                            .on_hover_text(format!("delete {}", seq.name))
                             .clicked()
                     {
-                        remove_seq = Some(i);
-                    }
-                    if ui
-                        .button("+ stage")
-                        .on_hover_text("insert a copy of the selected stage below this row")
-                        .clicked()
-                    {
-                        insert_stage = Some((i, 0));
+                        remove_seq = Some(seq_idx);
                     }
                 });
                 header.body(|ui| {
-                    let stage_idx = seq.stage_idx;
+                    let mut remove_stage: Option<usize> = None;
                     let n_stages = seq.stages.len();
-                    let mut select_stage = None;
-                    let mut remove_stage = None;
-                    for (j, stage) in seq.stages.iter_mut().enumerate() {
-                        ui.push_id(("stage", j), |ui| {
+                    for (stage_idx, stage) in seq.stages.iter_mut().enumerate() {
+                        ui.push_id(("stage", stage_idx), |ui| {
                             ui.horizontal(|ui| {
-                                let selected = i == sequence_idx && j == stage_idx;
-                                if name_button(ui, &mut stage.name, selected) {
-                                    select_stage = Some(j);
+                                if name_button(
+                                    ui,
+                                    &mut stage.name,
+                                    seq_idx == self.sequence_idx && stage_idx == self.stage_idx,
+                                ) {
+                                    // select_seq_stage = Some((seq_idx, stage_idx));
+                                    self.sequence_idx = seq_idx;
+                                    self.stage_idx = stage_idx;
                                 }
                                 if n_stages > 1
-                                    && ui.button("-").on_hover_text("delete this stage").clicked()
+                                    && ui
+                                        .button("🗑️")
+                                        .on_hover_text(format!("delete {}", stage.name))
+                                        .clicked()
                                 {
-                                    remove_stage = Some(j);
-                                }
-                                if ui
-                                    .button("+ stage")
-                                    .on_hover_text(
-                                        "insert a copy of the selected stage below this row",
-                                    )
-                                    .clicked()
-                                {
-                                    insert_stage = Some((i, j + 1));
+                                    remove_stage = Some(stage_idx);
                                 }
                             });
                         });
                     }
-                    if let Some(j) = select_stage {
-                        seq.stage_idx = j;
-                        select_seq = Some(i);
+                    if ui
+                        .button("+ stage")
+                        .on_hover_text("append a copy of the selected stage to this sequence")
+                        .clicked()
+                    {
+                        // let copy = self.selected_stage().clone();
+                        // self.sequences[seq_idx].stages.push(copy);
+                        append_stage = Some(seq_idx);
                     }
-                    if let Some(j) = remove_stage {
-                        seq.stages.remove(j);
-                        if seq.stage_idx > j {
-                            seq.stage_idx -= 1;
+                    // if let Some((seq_idx, stage_idx)) = select_stage {
+                    //     self.stage_idx = stage_idx;
+                    //     self.sequence_idx = seq_idx;
+                    // }
+                    if let Some(stage_idx) = remove_stage {
+                        seq.stages.remove(stage_idx);
+                        if self.sequence_idx == seq_idx {
+                            assert!(!seq.stages.is_empty(), "we can't handle empty sequences");
+                            self.stage_idx = self.stage_idx.min(seq.stages.len() - 1);
                         }
-                        seq.stage_idx = seq.stage_idx.min(seq.stages.len() - 1);
                     }
                 });
             });
         }
-        if let Some(i) = select_seq {
-            self.sequence_idx = i;
+        if ui
+            .button("+ sequence")
+            .on_hover_text("append a new sequence")
+            .clicked()
+        {
+            self.sequences
+                .push(Sequence::new(format!("sequence {}", self.sequences.len())));
         }
-        if let Some((i, pos)) = insert_stage {
-            let src = &self.sequences[self.sequence_idx];
-            let copy = src.stages[src.stage_idx].clone();
-            let seq = &mut self.sequences[i];
-            seq.stages.insert(pos, copy);
-            seq.stage_idx = pos;
-            self.sequence_idx = i;
+        if let Some(seq_idx) = append_stage {
+            let mut copy = self.selected_stage().clone();
+            copy.name = format!("stage {}", self.sequences[seq_idx].stages.len());
+            self.sequences[seq_idx].stages.push(copy);
         }
-        if let Some(i) = remove_seq {
-            self.sequences.remove(i);
-            if self.sequence_idx > i {
-                self.sequence_idx -= 1;
-            }
+        if let Some(seq_idx) = remove_seq {
+            self.sequences.remove(seq_idx);
+            assert!(!self.sequences.is_empty(), "we can't handle no sequences");
             self.sequence_idx = self.sequence_idx.min(self.sequences.len() - 1);
         }
     }
@@ -479,12 +488,15 @@ impl Filters {
     /// in processing order: terms, prev stage, stage fallback, sequence fallback.
     fn ui_stage(&mut self, ui: &mut egui::Ui) {
         let shared = self.shared_styles.clone();
-        let seq = &mut self.sequences[self.sequence_idx];
 
-        ui.strong(format!("{} / {}", seq.name, seq.stages[seq.stage_idx].name));
+        ui.strong(format!(
+            "{} / {}",
+            self.selected_sequence().name,
+            self.selected_stage().name
+        ));
 
-        let stage_idx = seq.stage_idx;
-        let stage = &mut seq.stages[stage_idx];
+        // let stage = self.selected_stage_mut();
+        let stage = &mut self.sequences[self.sequence_idx].stages[self.stage_idx];
 
         let mut remove_term = None;
         for (term_idx, term) in stage.terms.iter_mut().enumerate() {
@@ -496,7 +508,7 @@ impl Filters {
                 );
                 let header = state.show_header(ui, |ui| {
                     ui.label(term.set.label());
-                    if ui.button("-").clicked() {
+                    if ui.button("🗑️").clicked() {
                         remove_term = Some(term_idx);
                     }
                 });
@@ -509,7 +521,7 @@ impl Filters {
                                 for side in Side::ALL {
                                     side_state_ui(ui, side, set_term);
                                 }
-                                if n_rows > 1 && ui.button("-").clicked() {
+                                if n_rows > 1 && ui.button("🗑️").clicked() {
                                     remove_row = Some(row_idx);
                                 }
                             });
@@ -534,7 +546,7 @@ impl Filters {
 
         // meaningful from the second stage on; kept visible (disabled) on the
         // first stage so it's discoverable.
-        ui.add_enabled_ui(stage_idx > 0, |ui| {
+        ui.add_enabled_ui(self.stage_idx > 0, |ui| {
             ui.horizontal(|ui| {
                 ui.label("prev stage's pieces get");
                 let label = match &stage.include_prev {
@@ -599,7 +611,7 @@ impl Filters {
             "sequence_fallback",
             "sequence fallback",
             false,
-            &mut seq.fallback,
+            &mut self.selected_sequence_mut().fallback,
             &shared,
         );
     }
@@ -626,7 +638,7 @@ impl Filters {
                 );
                 let header = state.show_header(ui, |ui| {
                     name_button(ui, &mut style.name, false);
-                    if ui.button("-").clicked() {
+                    if ui.button("🗑️").clicked() {
                         remove = Some(i);
                     }
                 });
@@ -653,6 +665,7 @@ impl Default for Filters {
             }))],
             sequences: vec![Sequence::new("sequence 0".to_string())],
             sequence_idx: 0,
+            stage_idx: 0,
         }
     }
 }
@@ -990,7 +1003,7 @@ mod tests {
             include_prev: IncludePrev::Prev,
             ..Stage::new("stage 1".to_string())
         });
-        seq.stage_idx = 1;
+        filters.stage_idx = 1;
 
         let styled = filters.style_of(&piece(&[Side::R]));
         assert_eq!(styled.face_opacity, 0.25);
