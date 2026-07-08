@@ -46,6 +46,10 @@ impl eframe::App for App {
                     }
                 });
             }
+
+            ui.separator();
+            ui.label("view");
+            self.puzzle_view.ui(ui);
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
@@ -56,7 +60,7 @@ impl eframe::App for App {
             {
                 const SENSITIVITY: f32 = 0.5;
                 let drag = response.drag_delta();
-                self.puzzle_view.cam.drag(drag, SENSITIVITY);
+                self.puzzle_view.drag(drag, SENSITIVITY);
             }
 
             self.puzzle_view.draw(&ui.painter_at(rect), Instant::now());

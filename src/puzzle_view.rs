@@ -2,21 +2,30 @@ use std::{sync::Arc, time::Instant};
 
 use cgmath::{Rotation, Rotation3};
 use eframe::egui::{self, mutex::Mutex};
-use euc::{buffer::Buffer2d, rasterizer, Pipeline};
+use euc::{Pipeline, buffer::Buffer2d, rasterizer};
 
 use crate::puzzle_state::*;
 
 pub struct PuzzleView {
     puzzle: Arc<Mutex<PuzzleState>>,
-    pub cam: Camera,
+    /// view rotation (dragged with the mouse). in view space, not puzzle space.
+    rot: Rot,
     twist: Option<Anim<Twist>>,
     // selected_pieces: Vec<PieceId>,
     show_internal_stickers: bool,
-    // /// explode pieces away from the origin.
-    // piece_explode: f32,
-    // /// shrink to sticker centroid.
-    // sticker_scale: f32,
-    // outlines,
+    /// cull back-facing triangles. must be off to see sticker backs once
+    /// sticker_scale < 1.0 opens gaps into the pieces.
+    backface_culling: bool,
+    /// scale of the whole puzzle within the rect (replaces the old MARGIN).
+    puzzle_scale: f32,
+    /// move pieces away from the origin; 1.0 is assembled.
+    piece_explode: f32,
+    /// shrink each sticker toward its own centroid; 1.0 is full size.
+    sticker_scale: f32,
+    /// position of the puzzle center within the rect, in [-1, 1]. 0 is centered;
+    /// +1 projects the center to the right / top edge (exact under orthographic).
+    horizontal_align: f32,
+    vertical_align: f32,
     /// the software-rendered frame, re-uploaded to the GPU each draw.
     texture: Option<egui::TextureHandle>,
 }
@@ -24,17 +33,57 @@ impl PuzzleView {
     pub fn new(puzzle: Arc<Mutex<PuzzleState>>) -> Self {
         Self {
             puzzle,
-            cam: Camera::new(),
+            rot: Rot::from_angle_x(cgmath::Deg(20.0)) * Rot::from_angle_y(cgmath::Deg(-30.0)),
             twist: None,
             show_internal_stickers: true,
-            // piece_explode: 1.0,
-            // sticker_scale: 1.0,
+            backface_culling: true,
+            puzzle_scale: 1.0,
+            piece_explode: 1.0,
+            sticker_scale: 1.0,
+            horizontal_align: 0.0,
+            vertical_align: 0.0,
             texture: None,
         }
     }
 
     // fn sticker_of_pos(&self, pos: egui::Pos2) -> Option<PieceId> {}
     // fn piece_of_pos(&self, pos: egui::Pos2) -> Option<PieceId> {}
+
+    /// view controls.
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.checkbox(&mut self.show_internal_stickers, "internal stickers");
+        ui.checkbox(&mut self.backface_culling, "backface culling");
+        ui.add(egui::Slider::new(&mut self.puzzle_scale, 0.0..=2.0).text("puzzle scale"));
+        ui.add(egui::Slider::new(&mut self.piece_explode, 1.0..=3.0).text("piece explode"));
+        ui.add(egui::Slider::new(&mut self.sticker_scale, 0.0..=1.0).text("sticker scale"));
+        ui.add(egui::Slider::new(&mut self.horizontal_align, -1.0..=1.0).text("horizontal align"));
+        ui.add(egui::Slider::new(&mut self.vertical_align, -1.0..=1.0).text("vertical align"));
+    }
+
+    pub fn drag(&mut self, dv: egui::Vec2, sensitivity: f32) {
+        let dx = cgmath::Deg(dv.x * sensitivity);
+        let dy = cgmath::Deg(dv.y * sensitivity);
+        let rot_x = Rot::from_angle_x(dy);
+        let rot_y = Rot::from_angle_y(dx);
+        self.rot = rot_y * rot_x * self.rot;
+    }
+
+    /// Project a puzzle-space point to clip space (`[x, y, z, w]`, orthographic so
+    /// `w = 1`): apply the view rotation and alignment, and map z to a normalized
+    /// depth where smaller means nearer, matching `euc`'s `IfLessWrite` test.
+    fn project(&self, puzzle_pos: Vec3, sx: f32, sy: f32) -> [f32; 4] {
+        let pos = self.rot.rotate_vector(puzzle_pos);
+        // Widen the depth range with piece_explode so exploded-out pieces (which
+        // reach ~explode*sqrt(3) from the origin) stay inside the depth buffer.
+        let r = 3.0 * self.piece_explode.max(1.0);
+        let z = 0.5 - pos.z / (2.0 * r);
+        [
+            pos.x * sx + self.horizontal_align,
+            pos.y * sy + self.vertical_align,
+            z,
+            1.0,
+        ]
+    }
 
     pub fn draw(&mut self, painter: &egui::Painter, _now: Instant) {
         let puzzle = self.puzzle.lock();
@@ -48,14 +97,12 @@ impl PuzzleView {
         let w = ((rect.width() * ppp).round() as usize).clamp(1, 4096);
         let h = ((rect.height() * ppp).round() as usize).clamp(1, 4096);
 
-        // The puzzle is rendered orthographically. `sx`/`sy` map world units to
-        // NDC while keeping the puzzle square in a non-square viewport (matching
-        // the old `size().min_elem()` behaviour) with a margin around the edges.
-        // TODO: have puzzle_scale instead
-        const MARGIN: f32 = 0.9;
+        // The puzzle is rendered orthographically. `sx`/`sy` scale world units to
+        // NDC, keeping the puzzle square in a non-square viewport (matching the
+        // old `size().min_elem()` behavior).
         let min = w.min(h) as f32;
-        let sx = min * MARGIN / (2.0 * w as f32);
-        let sy = min * MARGIN / (2.0 * h as f32);
+        let sx = min * self.puzzle_scale / (2.0 * w as f32);
+        let sy = min * self.puzzle_scale / (2.0 * h as f32);
 
         // Correct visibility needs a per-pixel depth buffer, not a per-sticker
         // depth sort: sorting can't resolve interpenetrating or cyclically
@@ -63,6 +110,23 @@ impl PuzzleView {
         // with `euc`, which does per-pixel depth testing, then blit the result.
         let mut vertices: Vec<Vertex> = Vec::new();
         for piece in &puzzle.pieces {
+            // The piece's centroid (puzzle space, before the view rotation) is
+            // the direction it explodes along.
+            let mut sum = Vec3::new(0.0, 0.0, 0.0);
+            let mut count = 0.0;
+            for sticker in &piece.stickers {
+                for &v in &sticker.verts {
+                    sum += v;
+                    count += 1.0;
+                }
+            }
+            let piece_centroid = if count > 0.0 {
+                piece.rot * (sum / count)
+            } else {
+                Vec3::new(0.0, 0.0, 0.0)
+            };
+            let explode = piece_centroid * (self.piece_explode - 1.0);
+
             for sticker in &piece.stickers {
                 if !(self.show_internal_stickers || sticker.side.is_some()) {
                     continue;
@@ -75,10 +139,22 @@ impl PuzzleView {
                     color.g() as f32 / 255.0,
                     color.b() as f32 / 255.0,
                 );
+
+                // The sticker's centroid (local space) is the point sticker_scale
+                // shrinks it toward.
+                let ssum = sticker
+                    .verts
+                    .iter()
+                    .fold(Vec3::new(0.0, 0.0, 0.0), |acc, &v| acc + v);
+                let s_centroid = ssum / sticker.verts.len() as f32;
+
                 let clip: Vec<[f32; 4]> = sticker
                     .verts
                     .iter()
-                    .map(|&v| self.cam.proj_clip(piece.rot * v, sx, sy))
+                    .map(|&v| {
+                        let scaled = s_centroid + (v - s_centroid) * self.sticker_scale;
+                        self.project(piece.rot * scaled + explode, sx, sy)
+                    })
                     .collect();
                 // Fan-triangulate the (convex) sticker polygon.
                 for i in 1..clip.len().saturating_sub(1) {
@@ -91,11 +167,23 @@ impl PuzzleView {
 
         let mut color_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
         let mut depth_buf = Buffer2d::new([w, h], 1.0f32);
-        StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
-            &vertices,
-            &mut color_buf,
-            Some(&mut depth_buf),
-        );
+        // Backface culling is a compile-time type param in euc, so branch over the
+        // two monomorphizations. All stickers are wound counterclockwise as seen
+        // from outside their piece, so back faces are the ones hidden inside.
+        if self.backface_culling {
+            StickerPipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingEnabled>, _>(
+                &vertices,
+                &mut color_buf,
+                Some(&mut depth_buf),
+            );
+        } else {
+            StickerPipeline
+                .draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
+                    &vertices,
+                    &mut color_buf,
+                    Some(&mut depth_buf),
+                );
+        }
 
         let image = egui::ColorImage::new([w, h], color_buf.as_ref().to_vec());
         let options = egui::TextureOptions::NEAREST;
@@ -137,34 +225,4 @@ impl Pipeline for StickerPipeline {
 struct Anim<T> {
     t: T,
     start: Instant,
-}
-
-pub struct Camera {
-    rot: Rot,
-}
-impl Camera {
-    pub fn new() -> Self {
-        Self {
-            rot: Rot::from_angle_x(cgmath::Deg(20.0)) * Rot::from_angle_y(cgmath::Deg(-30.0)),
-        }
-    }
-
-    /// Project a world-space point to clip space (`[x, y, z, w]`, orthographic so
-    /// `w = 1`). `sx`/`sy` scale x/y into NDC; z is a normalized depth in `[0, 1]`
-    /// where smaller means nearer, matching `euc`'s `IfLessWrite` depth test.
-    fn proj_clip(&self, pos: Vec3, sx: f32, sy: f32) -> [f32; 4] {
-        let pos = self.rot.rotate_vector(pos);
-        // Cube corners reach |coord| ~= sqrt(3); R = 2 keeps z comfortably in [0, 1].
-        const R: f32 = 2.0;
-        let z = 0.5 - pos.z / (2.0 * R);
-        [pos.x * sx, pos.y * sy, z, 1.0]
-    }
-
-    pub fn drag(&mut self, dv: egui::Vec2, sensitivity: f32) {
-        let dx = cgmath::Deg(dv.x * sensitivity);
-        let dy = cgmath::Deg(dv.y * sensitivity);
-        let rot_x = Rot::from_angle_x(dy);
-        let rot_y = Rot::from_angle_y(dx);
-        self.rot = rot_y * rot_x * self.rot;
-    }
 }

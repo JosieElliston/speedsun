@@ -9,3 +9,12 @@
 - fmc timeline
     - operations twist, macro, fork, niss, mark/comment
     - fork is how you search different paths
+- thing to derive a subpuzzle by deleting pieces
+- twist gizmos should show what twists are blocked, without needing to fail a twist
+- on a failed twist, red flash the blocked pieces. red flashing pieces are drawn on top of the others. like hactars stylized opacity. also red flash should have a fade animation. maybe grey out or semitransparent the non blocking pieces.
+- refl puzzles
+- if you do too many blocked moves in a row, offer to switch to an easier puzzle, maybe sun cube ultimate.
+- stickerings: super, center compass, edge vs corner triangle distinguishable.
+- latched, bandaging pieces, gear
+- custom scrambler
+- chromebook support??
