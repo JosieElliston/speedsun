@@ -2,12 +2,13 @@ use std::{sync::Arc, time::Instant};
 
 use eframe::egui::{self, mutex::Mutex};
 
-use crate::{puzzle_state::*, puzzle_view::*};
+use crate::{filters::Filters, puzzle_state::*, puzzle_view::*};
 
 pub struct App {
     puzzle: Arc<Mutex<PuzzleState>>,
     puzzle_view: PuzzleView,
     layer: u8,
+    filters: Filters,
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
@@ -16,6 +17,7 @@ impl App {
             puzzle: Arc::clone(&puzzle),
             puzzle_view: PuzzleView::new(Arc::clone(&puzzle)),
             layer: 0,
+            filters: Filters::default(),
         }
     }
 }
@@ -52,6 +54,12 @@ impl eframe::App for App {
             self.puzzle_view.ui(ui);
         });
 
+        egui::Panel::right("filters").show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                self.filters.ui(ui);
+            });
+        });
+
         egui::CentralPanel::default().show(ui, |ui| {
             let (rect, response) =
                 ui.allocate_exact_size(ui.available_size(), egui::Sense::click_and_drag());
@@ -63,8 +71,13 @@ impl eframe::App for App {
                 self.puzzle_view.drag(drag, SENSITIVITY);
             }
 
-            self.puzzle_view
-                .draw(&ui.painter_at(rect), &response, self.layer, Instant::now());
+            self.puzzle_view.draw(
+                &ui.painter_at(rect),
+                &response,
+                self.layer,
+                &self.filters,
+                Instant::now(),
+            );
         });
     }
 }

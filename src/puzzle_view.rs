@@ -8,7 +8,10 @@ use cgmath::{InnerSpace, Rotation, Rotation3};
 use eframe::egui::{self, mutex::Mutex};
 use euc::{Pipeline, Target, buffer::Buffer2d, rasterizer};
 
-use crate::puzzle_state::*;
+use crate::{
+    filters::{FaceColor, Filters},
+    puzzle_state::*,
+};
 
 /// below this many frames per twist, animation progress is frame-indexed
 /// instead of clock-based: each drawn frame advances by exactly 1/n_frames, so
@@ -369,6 +372,7 @@ impl PuzzleView {
         painter: &egui::Painter,
         response: &egui::Response,
         layer: u8,
+        filters: &Filters,
         now: Instant,
     ) {
         // Clone the Arc so the lock guard doesn't borrow self (advance_twist
@@ -480,6 +484,9 @@ impl PuzzleView {
         // overlapping polygons. We rasterize every sticker triangle on the CPU
         // with `euc`, which does per-pixel depth testing, then blit the result.
         let mut vertices: Vec<Vertex> = Vec::new();
+        // stickers whose filter style makes them translucent; rendered as a
+        // stylized-transparency overlay instead of into the base pass.
+        let mut overlay_vertices: Vec<Vertex> = Vec::new();
         // pure-red copies of the blocked pieces' triangles, overlaid on top of
         // the normally-drawn scene with stylized transparency.
         let mut flash_vertices: Vec<Vertex> = Vec::new();
@@ -494,6 +501,19 @@ impl PuzzleView {
             };
             let flashed = matches!(&flash, Some((mask, _)) if mask[piece_idx]);
 
+            let style = filters.style_of(piece);
+            let face_a = style.face_opacity.clamp(0.0, 1.0);
+            let outline_a = style.outline_opacity.clamp(0.0, 1.0);
+            let outline_w = self.outline_width * style.outline_size;
+            let outline_rgba = (
+                style.outline_color.r() as f32 / 255.0,
+                style.outline_color.g() as f32 / 255.0,
+                style.outline_color.b() as f32 / 255.0,
+                outline_a,
+            );
+            // a face_opacity-0 piece with a visible outline draws as wireframe.
+            let visible = face_a > 0.0 || (outline_a > 0.0 && outline_w > 0.0);
+
             // Explode moves each piece along the sum of its colored stickers'
             // face normals (rotated to the current orientation), which in
             // cubeshape keeps each side's stickers coplanar as the puzzle
@@ -504,13 +524,17 @@ impl PuzzleView {
                 if !(self.show_internal_stickers || sticker.side.is_some()) {
                     continue;
                 }
-                let color = sticker
-                    .side
-                    .map_or(egui::Color32::GRAY, |side| side.color());
-                let rgb = (
+                let color = match &style.face_color {
+                    FaceColor::Sticker => sticker
+                        .side
+                        .map_or(egui::Color32::GRAY, |side| side.color()),
+                    FaceColor::Fixed(color) => *color,
+                };
+                let face_rgba = (
                     color.r() as f32 / 255.0,
                     color.g() as f32 / 255.0,
                     color.b() as f32 / 255.0,
+                    face_a,
                 );
 
                 // The sticker's centroid (local space) is the point sticker_shrink
@@ -525,6 +549,24 @@ impl PuzzleView {
                         self.project(piece_rot * scaled + explode, sx, sy)
                     })
                     .collect();
+
+                // blocked pieces flash even where filters hide them: the flash
+                // is what explains why the twist was rejected.
+                if flashed {
+                    const RED: Rgba = (1.0, 0.0, 0.0, 1.0);
+                    const BLACK: Rgba = (0.0, 0.0, 0.0, 1.0);
+                    push_fan(
+                        &mut flash_vertices,
+                        &clip,
+                        RED,
+                        BLACK,
+                        self.outline_width,
+                        w,
+                        h,
+                    );
+                }
+                // filtered-out pieces stay pickable (the hover/selection
+                // outlines can highlight them); they're just not drawn.
                 if let Some((u, v)) = pick_pos {
                     for i in 1..clip.len().saturating_sub(1) {
                         if let Some(z) =
@@ -535,12 +577,18 @@ impl PuzzleView {
                         }
                     }
                 }
-
-                push_fan(&mut vertices, &clip, rgb, w, h);
-                if flashed {
-                    const RED: (f32, f32, f32) = (1.0, 0.0, 0.0);
-                    push_fan(&mut flash_vertices, &clip, RED, w, h);
+                if !visible {
+                    continue;
                 }
+
+                // a fully opaque face renders opaque pixels regardless of the
+                // outline's opacity (the outline blends toward the face).
+                let target = if face_a >= 1.0 {
+                    &mut vertices
+                } else {
+                    &mut overlay_vertices
+                };
+                push_fan(target, &clip, face_rgba, outline_rgba, outline_w, w, h);
             }
         }
 
@@ -558,9 +606,7 @@ impl PuzzleView {
             }
         }
 
-        let sticker_pipeline = StickerPipeline {
-            outline_width: self.outline_width,
-        };
+        let sticker_pipeline = StickerPipeline;
         let mut color_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
         let mut depth_buf = Buffer2d::new([w, h], 1.0f32);
         rasterize(
@@ -570,6 +616,23 @@ impl PuzzleView {
             &mut depth_buf,
             self.backface_culling,
         );
+
+        // Stylized-transparency pass for the filter-translucent stickers:
+        // rendered opaquely among themselves into their own buffer (nearest
+        // surface wins, no fog-like buildup), keeping the base pass's depth
+        // buffer so opaque geometry in front still occludes them, then
+        // composited per pixel by their own alpha.
+        if !overlay_vertices.is_empty() {
+            let mut over_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
+            rasterize(
+                &sticker_pipeline,
+                &overlay_vertices,
+                &mut over_buf,
+                &mut depth_buf,
+                self.backface_culling,
+            );
+            blend_overlay(&mut color_buf, &over_buf);
+        }
 
         // White outline overlays: thin for selected pieces, thick for the
         // shift-hovered piece. On top of normal pieces, but drawn before (so
@@ -595,7 +658,9 @@ impl PuzzleView {
                             self.project(piece_rot * scaled + explode, sx, sy)
                         })
                         .collect();
-                    push_fan(out, &clip, (1.0, 1.0, 1.0), w, h);
+                    // only the edge distances matter to OutlinePipeline.
+                    const WHITE: Rgba = (1.0, 1.0, 1.0, 1.0);
+                    push_fan(out, &clip, WHITE, WHITE, 0.0, w, h);
                 }
             };
 
@@ -687,7 +752,17 @@ impl PuzzleView {
                     .iter()
                     .map(|&v| self.project(v, sx, sy))
                     .collect();
-                push_fan(&mut gizmo_vertices, &clip, rgb, w, h);
+                let face = (rgb.0, rgb.1, rgb.2, 1.0);
+                const BLACK: Rgba = (0.0, 0.0, 0.0, 1.0);
+                push_fan(
+                    &mut gizmo_vertices,
+                    &clip,
+                    face,
+                    BLACK,
+                    self.outline_width,
+                    w,
+                    h,
+                );
             }
             let base = color_buf.as_ref().to_vec();
             depth_buf.clear(1.0);
@@ -715,16 +790,29 @@ impl PuzzleView {
     }
 }
 
-/// A clip-space position, plus an (r, g, b) color and per-vertex edge
-/// distances (see `push_fan`) carried to the fragment stage.
-type Vertex = ([f32; 4], ((f32, f32, f32), (f32, f32, f32)));
+/// straight-alpha (r, g, b, a), each in [0, 1].
+type Rgba = (f32, f32, f32, f32);
+
+/// A clip-space position, plus the sticker's style (face color, outline color,
+/// outline width in pixels) and per-vertex edge distances (see `push_fan`)
+/// carried to the fragment stage.
+type VsOut = (Rgba, Rgba, f32, (f32, f32, f32));
+type Vertex = ([f32; 4], VsOut);
 
 /// Fan-triangulate a convex clip-space polygon into `out`, attaching edge
 /// attributes for outline drawing: component k, interpolated across the
 /// triangle, is the pixel-space distance to the triangle edge opposite vertex
 /// k — but only where that edge is a boundary edge of the polygon. Interior
 /// fan diagonals get a huge constant instead so they never darken.
-fn push_fan(out: &mut Vec<Vertex>, clip: &[[f32; 4]], rgb: (f32, f32, f32), w: usize, h: usize) {
+fn push_fan(
+    out: &mut Vec<Vertex>,
+    clip: &[[f32; 4]],
+    face: Rgba,
+    outline: Rgba,
+    outline_width: f32,
+    w: usize,
+    h: usize,
+) {
     /// far enough that outline shading never triggers.
     const FAR: f32 = 1e6;
     // Distances must be measured in the same space euc rasterizes in; the
@@ -753,9 +841,9 @@ fn push_fan(out: &mut Vec<Vertex>, clip: &[[f32; 4]], rgb: (f32, f32, f32), w: u
         } else {
             (FAR, FAR, FAR)
         };
-        out.push((a, (rgb, (ha, e1a, e2a))));
-        out.push((b, (rgb, (0.0, e1b, e2b))));
-        out.push((c, (rgb, (0.0, e1c, e2c))));
+        out.push((a, (face, outline, outline_width, (ha, e1a, e2a))));
+        out.push((b, (face, outline, outline_width, (0.0, e1b, e2b))));
+        out.push((c, (face, outline, outline_width, (0.0, e1c, e2c))));
     }
 }
 
@@ -790,7 +878,7 @@ struct OutlinePipeline {
 }
 impl Pipeline for OutlinePipeline {
     type Vertex = Vertex;
-    type VsOut = ((f32, f32, f32), (f32, f32, f32));
+    type VsOut = VsOut;
     type Pixel = f32;
 
     #[inline(always)]
@@ -799,9 +887,26 @@ impl Pipeline for OutlinePipeline {
     }
 
     #[inline(always)]
-    fn frag(&self, ((_r, _g, _b), (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
+    fn frag(&self, (_face, _outline, _width, (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
         let d = ea.min(*eb).min(*ec);
         (self.width + 0.5 - d).clamp(0.0, 1.0)
+    }
+}
+
+/// composite a premultiplied-alpha overlay buffer over the frame, per pixel:
+/// `out = (1 - a) * base + over`.
+fn blend_overlay(base: &mut Buffer2d<egui::Color32>, over: &Buffer2d<egui::Color32>) {
+    for (b, o) in base.as_mut().iter_mut().zip(over.as_ref()) {
+        if o.a() > 0 {
+            let a = o.a() as f32 / 255.0;
+            let ch = |bv: u8, ov: u8| ((1.0 - a) * bv as f32 + ov as f32).min(255.0).round() as u8;
+            *b = egui::Color32::from_rgba_premultiplied(
+                ch(b.r(), o.r()),
+                ch(b.g(), o.g()),
+                ch(b.b(), o.b()),
+                ch(b.a(), o.a()),
+            );
+        }
     }
 }
 
@@ -866,14 +971,12 @@ fn rasterize<P: Pipeline<Vertex = Vertex>>(
 }
 
 /// CPU rasterization pipeline for the flat-shaded stickers. Depth testing uses
-/// `euc`'s default `IfLessWrite` strategy against the depth buffer.
-struct StickerPipeline {
-    /// outline width in physical pixels; 0 disables outlines.
-    outline_width: f32,
-}
+/// `euc`'s default `IfLessWrite` strategy against the depth buffer. Emits
+/// premultiplied alpha so `blend_overlay` compositing is a multiply-add.
+struct StickerPipeline;
 impl Pipeline for StickerPipeline {
     type Vertex = Vertex;
-    type VsOut = ((f32, f32, f32), (f32, f32, f32));
+    type VsOut = VsOut;
     type Pixel = egui::Color32;
 
     #[inline(always)]
@@ -882,19 +985,25 @@ impl Pipeline for StickerPipeline {
     }
 
     #[inline(always)]
-    fn frag(&self, ((r, g, b), (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
-        // Pixel distance to the nearest polygon boundary edge; darken within
-        // outline_width of it, antialiased over one pixel.
-        let t = if self.outline_width > 0.0 {
+    fn frag(&self, (face, outline, width, (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
+        // Pixel coverage of the outline: 1 within `width` of the nearest
+        // polygon boundary edge, antialiased over one pixel.
+        let c = if *width > 0.0 {
             let d = ea.min(*eb).min(*ec);
-            (d - self.outline_width + 0.5).clamp(0.0, 1.0)
+            (width + 0.5 - d).clamp(0.0, 1.0)
         } else {
-            1.0
+            0.0
         };
-        egui::Color32::from_rgb(
-            (r * t * 255.0) as u8,
-            (g * t * 255.0) as u8,
-            (b * t * 255.0) as u8,
+        // The outline (opacity outline.3, scaled by its coverage) composited
+        // over the face (opacity face.3).
+        let a_out = outline.3 * c;
+        let a = a_out + face.3 * (1.0 - a_out);
+        let ch = |f: f32, o: f32| ((o * a_out + f * face.3 * (1.0 - a_out)) * 255.0).round() as u8;
+        egui::Color32::from_rgba_premultiplied(
+            ch(face.0, outline.0),
+            ch(face.1, outline.1),
+            ch(face.2, outline.2),
+            (a * 255.0).round() as u8,
         )
     }
 }

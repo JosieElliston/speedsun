@@ -10,7 +10,7 @@ const ROT_ID: Rot = Rot::new(1.0, 0.0, 0.0, 0.0);
 // TODO: factor usage of Plane into a struct
 // struct Plane
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     R,
     L,
