@@ -955,11 +955,15 @@ impl Default for Filters {
     }
 }
 
-/// a `name_button` for a fixed name: same look, but no renaming.
+const RENAME_BUTTON_MIN_WIDTH: f32 = 110.0;
+
+/// a `rename_button` for a fixed name: same look, but no renaming.
 /// returns whether it was clicked.
-// TODO: this should be centered like `name_button`.
 fn no_rename_button(ui: &mut egui::Ui, name: &str, hover: &str, selected: bool) -> bool {
-    let mut button = egui::Button::new(name).min_size(egui::vec2(110.0, 0.0));
+    // grow atoms on both sides center the text regardless of the surrounding
+    // layout's alignment, matching how `rename_button` reads in its header.
+    let mut button = egui::Button::new((egui::Atom::grow(), name, egui::Atom::grow()))
+        .min_size(egui::vec2(RENAME_BUTTON_MIN_WIDTH, 0.0));
     button = button.selected(selected);
     ui.add(button).on_hover_text(hover).clicked()
 }
@@ -973,7 +977,8 @@ fn rename_button(ui: &mut egui::Ui, name: &mut String, selected: bool) -> bool {
         .data(|d| d.get_temp::<bool>(renaming_id))
         .unwrap_or(false);
     if renaming {
-        let response = ui.add(egui::TextEdit::singleline(name).desired_width(110.0));
+        let response =
+            ui.add(egui::TextEdit::singleline(name).desired_width(RENAME_BUTTON_MIN_WIDTH));
         if ui.data(|d| d.get_temp::<bool>(fresh_id)).unwrap_or(false) {
             response.request_focus();
             ui.data_mut(|d| d.remove::<bool>(fresh_id));
@@ -982,7 +987,8 @@ fn rename_button(ui: &mut egui::Ui, name: &mut String, selected: bool) -> bool {
         }
         false
     } else {
-        let mut button = egui::Button::new(name.as_str()).min_size(egui::vec2(110.0, 0.0));
+        let mut button =
+            egui::Button::new(name.as_str()).min_size(egui::vec2(RENAME_BUTTON_MIN_WIDTH, 0.0));
         button = button.selected(selected);
         let response = ui.add(button).on_hover_text("right click to rename");
         if response.secondary_clicked() {
