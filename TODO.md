@@ -11,6 +11,7 @@
     - use styles for hovered / selected / blocked.
     - have draw order as part of styles?
     - basic's labels should match the partial styles'
+    - outline_opacity should just be the alpha of the outline color.
 - keybinds
 - macros
 - saved preferences

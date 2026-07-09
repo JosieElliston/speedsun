@@ -193,15 +193,15 @@ mod style {
                     face_opacity: None,
                     face_color: None,
                     outline_opacity: Some(1.0),
-                    outline_size: Some(2.0),
+                    outline_size: Some(5.0),
                     outline_color: Some(Color32::WHITE),
                 }))),
                 selected: Rc::new(RefCell::new(SelectedStyle(PartialStyle {
                     face_opacity: None,
                     face_color: None,
                     outline_opacity: Some(1.0),
-                    outline_size: Some(2.0),
-                    outline_color: Some(Color32::LIGHT_GRAY),
+                    outline_size: Some(5.0),
+                    outline_color: Some(Color32::from_rgb(230, 230, 230)),
                 }))),
                 user: vec![
                     Rc::new(RefCell::new(UserStyle {
@@ -499,6 +499,21 @@ impl Filters {
             Some(style) => style.or(&fallback),
         }
         .unwrap_or(&self.styles.basic.borrow().0)
+    }
+
+    /// the style for a piece given its interaction state. the (shift-) hovered
+    /// style applies before the selected style, which applies
+    /// before the filter style; earlier wins per-field, so hovered shadows
+    /// selection shadows filters.
+    pub fn style_of_state(&self, piece: &Piece, hovered: bool, selected: bool) -> CompleteStyle {
+        let mut partial = PartialStyle::NONE;
+        if hovered {
+            partial = partial.or(&self.styles.hovered.borrow().0);
+        }
+        if selected {
+            partial = partial.or(&self.styles.selected.borrow().0);
+        }
+        partial.unwrap_or(&self.style_of(piece))
     }
 
     fn selected_stage(&self) -> Option<&Stage> {
@@ -1259,6 +1274,7 @@ mod tests {
     #[test]
     fn style_of_applies_term_and_fallback() {
         let mut filters = Filters::default();
+        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
         // drop the seeded "all pieces get basic" term: it's complete and
         // earlier terms win per-field, so it would mask the term under test.
         filters.sequences[0].stages[0].terms.clear();
@@ -1284,6 +1300,7 @@ mod tests {
     #[test]
     fn no_selection_shows_basic() {
         let mut filters = Filters::default();
+        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
         // a stage that styles everything at 0.25...
         let stage = &mut filters.sequences[0].stages[0];
         stage.terms.clear();
@@ -1306,6 +1323,7 @@ mod tests {
     #[test]
     fn earlier_terms_win() {
         let mut filters = Filters::default();
+        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
         let basic = FilterStyle::Basic(Rc::clone(&filters.styles.basic));
         let stage = &mut filters.sequences[0].stages[0];
         // terms read top-down like match arms: a narrowed term first, then a
@@ -1335,6 +1353,7 @@ mod tests {
     #[test]
     fn fallback_chain() {
         let mut filters = Filters::default();
+        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
         let seq = &mut filters.sequences[0];
         // drop the seeded "all pieces get basic" term so that pieces are
         // unmatched and actually reach the fallbacks.

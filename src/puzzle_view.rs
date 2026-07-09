@@ -22,11 +22,6 @@ const FAST_MODE_MAX_FRAMES: f32 = 3.0;
 /// opacity of the hovered twist gizmo face.
 const GIZMO_ALPHA: f32 = 0.35;
 
-/// white outline width (physical pixels) of the shift-hovered piece.
-const HIGHLIGHT_OUTLINE_WIDTH: f32 = 12.0;
-/// white outline width (physical pixels) of selected pieces.
-const SELECTED_OUTLINE_WIDTH: f32 = 4.5;
-
 fn ease(t: f32) -> f32 {
     // cosine interpolation
     0.5 - 0.5 * (t * std::f32::consts::PI).cos()
@@ -490,10 +485,60 @@ impl PuzzleView {
         // pure-red copies of the blocked pieces' triangles, overlaid on top of
         // the normally-drawn scene with stylized transparency.
         let mut flash_vertices: Vec<Vertex> = Vec::new();
-        // with shift held, pick the piece under the pointer: nearest clip-space
-        // depth among the sticker triangles containing the pointer.
+
+        // with shift held, pick the piece under the pointer (nearest clip-space
+        // depth among the sticker triangles containing it) in a pre-pass, so
+        // its hovered style can be applied in the normal draw order below.
+        // filtered-out pieces stay pickable; picking ignores their visibility.
         let pick_pos = if shift { pointer_clip } else { None };
-        let mut pick_best: Option<(usize, f32)> = None;
+        let hovered_piece: Option<usize> = pick_pos.and_then(|(u, v)| {
+            let mut pick_best: Option<(usize, f32)> = None;
+            for (piece_idx, piece) in puzzle.pieces.iter().enumerate() {
+                let piece_rot = match &anim {
+                    Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
+                    _ => piece.rot,
+                };
+                let explode = (piece_rot * piece.explode_dir()) * (self.piece_explode - 1.0);
+                for sticker in &piece.stickers {
+                    if !(self.show_internal_stickers || sticker.side.is_some()) {
+                        continue;
+                    }
+                    let s_centroid = sticker.centroid().unwrap();
+                    let clip: Vec<[f32; 4]> = sticker
+                        .verts
+                        .iter()
+                        .map(|&vt| {
+                            let scaled = s_centroid + (vt - s_centroid) * self.sticker_shrink;
+                            self.project(piece_rot * scaled + explode, sx, sy)
+                        })
+                        .collect();
+                    for i in 1..clip.len().saturating_sub(1) {
+                        if let Some(z) =
+                            bary_z(clip[0], clip[i], clip[i + 1], u, v, self.backface_culling)
+                            && pick_best.is_none_or(|(_, best_z)| z < best_z)
+                        {
+                            pick_best = Some((piece_idx, z));
+                        }
+                    }
+                }
+            }
+            pick_best.map(|(piece_idx, _)| piece_idx)
+        });
+
+        // shift-click toggles the hovered piece's membership in the selection;
+        // shift-clicking the background clears the selection. handled before
+        // rendering so the change is reflected in this frame's styles.
+        if shift && response.clicked() {
+            match hovered_piece {
+                Some(piece_idx) => {
+                    if !self.selected_pieces.remove(&piece_idx) {
+                        self.selected_pieces.insert(piece_idx);
+                    }
+                }
+                None => self.selected_pieces.clear(),
+            }
+        }
+
         for (piece_idx, piece) in puzzle.pieces.iter().enumerate() {
             let piece_rot = match &anim {
                 Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
@@ -501,7 +546,9 @@ impl PuzzleView {
             };
             let flashed = matches!(&flash, Some((mask, _)) if mask[piece_idx]);
 
-            let style = filters.style_of(piece);
+            let hovered = hovered_piece == Some(piece_idx);
+            let selected = self.selected_pieces.contains(&piece_idx);
+            let style = filters.style_of_state(piece, hovered, selected);
             let face_a = style.face_opacity.clamp(0.0, 1.0);
             let outline_a = style.outline_opacity.clamp(0.0, 1.0);
             let outline_w = self.outline_width * style.outline_size;
@@ -565,18 +612,6 @@ impl PuzzleView {
                         h,
                     );
                 }
-                // filtered-out pieces stay pickable (the hover/selection
-                // outlines can highlight them); they're just not drawn.
-                if let Some((u, v)) = pick_pos {
-                    for i in 1..clip.len().saturating_sub(1) {
-                        if let Some(z) =
-                            bary_z(clip[0], clip[i], clip[i + 1], u, v, self.backface_culling)
-                            && pick_best.is_none_or(|(_, best_z)| z < best_z)
-                        {
-                            pick_best = Some((piece_idx, z));
-                        }
-                    }
-                }
                 if !visible {
                     continue;
                 }
@@ -589,20 +624,6 @@ impl PuzzleView {
                     &mut overlay_vertices
                 };
                 push_fan(target, &clip, face_rgba, outline_rgba, outline_w, w, h);
-            }
-        }
-
-        // shift-click toggles the hovered piece's membership in the selection;
-        // shift-clicking the background clears the selection.
-        let hovered_piece = pick_best.map(|(piece_idx, _)| piece_idx);
-        if shift && response.clicked() {
-            match hovered_piece {
-                Some(piece_idx) => {
-                    if !self.selected_pieces.remove(&piece_idx) {
-                        self.selected_pieces.insert(piece_idx);
-                    }
-                }
-                None => self.selected_pieces.clear(),
             }
         }
 
@@ -632,72 +653,6 @@ impl PuzzleView {
                 self.backface_culling,
             );
             blend_overlay(&mut color_buf, &over_buf);
-        }
-
-        // White outline overlays: thin for selected pieces, thick for the
-        // shift-hovered piece. On top of normal pieces, but drawn before (so
-        // under) the blocked flash and the gizmos.
-        if hovered_piece.is_some() || !self.selected_pieces.is_empty() {
-            let emit_piece_outline = |piece_idx: usize, out: &mut Vec<Vertex>| {
-                let piece = &puzzle.pieces[piece_idx];
-                let piece_rot = match &anim {
-                    Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
-                    _ => piece.rot,
-                };
-                let explode = (piece_rot * piece.explode_dir()) * (self.piece_explode - 1.0);
-                for sticker in &piece.stickers {
-                    if !(self.show_internal_stickers || sticker.side.is_some()) {
-                        continue;
-                    }
-                    let s_centroid = sticker.centroid().unwrap();
-                    let clip: Vec<[f32; 4]> = sticker
-                        .verts
-                        .iter()
-                        .map(|&v| {
-                            let scaled = s_centroid + (v - s_centroid) * self.sticker_shrink;
-                            self.project(piece_rot * scaled + explode, sx, sy)
-                        })
-                        .collect();
-                    // only the edge distances matter to OutlinePipeline.
-                    const WHITE: Rgba = (1.0, 1.0, 1.0, 1.0);
-                    push_fan(out, &clip, WHITE, WHITE, 0.0, w, h);
-                }
-            };
-
-            let mut outline_alpha = Buffer2d::new([w, h], 0.0f32);
-            if !self.selected_pieces.is_empty() {
-                let mut outline_vertices: Vec<Vertex> = Vec::new();
-                for &piece_idx in &self.selected_pieces {
-                    emit_piece_outline(piece_idx, &mut outline_vertices);
-                }
-                depth_buf.clear(1.0);
-                rasterize(
-                    &OutlinePipeline {
-                        width: SELECTED_OUTLINE_WIDTH,
-                    },
-                    &outline_vertices,
-                    &mut outline_alpha,
-                    &mut depth_buf,
-                    self.backface_culling,
-                );
-                blend_outline(&mut color_buf, &outline_alpha);
-            }
-            if let Some(piece_idx) = hovered_piece {
-                let mut outline_vertices: Vec<Vertex> = Vec::new();
-                emit_piece_outline(piece_idx, &mut outline_vertices);
-                outline_alpha.clear(0.0);
-                depth_buf.clear(1.0);
-                rasterize(
-                    &OutlinePipeline {
-                        width: HIGHLIGHT_OUTLINE_WIDTH,
-                    },
-                    &outline_vertices,
-                    &mut outline_alpha,
-                    &mut depth_buf,
-                    self.backface_culling,
-                );
-                blend_outline(&mut color_buf, &outline_alpha);
-            }
         }
 
         if let Some((_, strength)) = &flash
@@ -869,30 +824,6 @@ fn blend_layers(base: &[egui::Color32], over: &mut Buffer2d<egui::Color32>, alph
     }
 }
 
-/// renders only sticker outlines: the pixel is the white-outline coverage in
-/// [0, 1], 0 in the sticker interior. composited by `blend_outline`, so the
-/// interior leaves the frame untouched.
-struct OutlinePipeline {
-    /// outline width in physical pixels.
-    width: f32,
-}
-impl Pipeline for OutlinePipeline {
-    type Vertex = Vertex;
-    type VsOut = VsOut;
-    type Pixel = f32;
-
-    #[inline(always)]
-    fn vert(&self, (pos, vs_out): &Self::Vertex) -> ([f32; 4], Self::VsOut) {
-        (*pos, *vs_out)
-    }
-
-    #[inline(always)]
-    fn frag(&self, (_face, _outline, _width, (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
-        let d = ea.min(*eb).min(*ec);
-        (self.width + 0.5 - d).clamp(0.0, 1.0)
-    }
-}
-
 /// composite a premultiplied-alpha overlay buffer over the frame, per pixel:
 /// `out = (1 - a) * base + over`.
 fn blend_overlay(base: &mut Buffer2d<egui::Color32>, over: &Buffer2d<egui::Color32>) {
@@ -905,21 +836,6 @@ fn blend_overlay(base: &mut Buffer2d<egui::Color32>, over: &Buffer2d<egui::Color
                 ch(b.g(), o.g()),
                 ch(b.b(), o.b()),
                 ch(b.a(), o.a()),
-            );
-        }
-    }
-}
-
-/// composite a white outline coverage buffer over the frame.
-fn blend_outline(color_buf: &mut Buffer2d<egui::Color32>, alpha: &Buffer2d<f32>) {
-    for (c, &a) in color_buf.as_mut().iter_mut().zip(alpha.as_ref().iter()) {
-        if a > 0.0 {
-            let lerp = |x: u8| ((1.0 - a) * x as f32 + a * 255.0).round() as u8;
-            *c = egui::Color32::from_rgba_premultiplied(
-                lerp(c.r()),
-                lerp(c.g()),
-                lerp(c.b()),
-                lerp(c.a()),
             );
         }
     }
