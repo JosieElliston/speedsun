@@ -459,46 +459,53 @@ impl Sequence {
     }
 }
 
+/// which stage the puzzle is displayed with
+/// (and which stage the stage editor section edits).
+/// with `None`, the entire puzzle is shown with the builtin basic style.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SelectedSeqStage {
+    None,
+    Some { seq: usize, stage: usize },
+}
+
 #[derive(Debug, Clone)]
 pub struct Filters {
     styles: Styles,
     /// the style shown in the style editor section.
     selected_style_idx: StyleIdx,
     sequences: Vec<Sequence>,
-    selected_sequence_idx: usize,
-    selected_stage_idx: usize,
+    selected_seq_stage: SelectedSeqStage,
 }
 impl Filters {
     // TODO: bake the prev stage search into the stage to make this constant time
     // (rather than linear) (in the number of stages) (it'll still be linear in the number of terms).
     pub fn style_of(&self, piece: &Piece) -> CompleteStyle {
-        let seq = &self.selected_sequence();
-        let stage = &seq.stages[self.selected_stage_idx];
+        let SelectedSeqStage::Some {
+            seq: seq_idx,
+            stage: stage_idx,
+        } = self.selected_seq_stage
+        else {
+            // no stage selected: the entire puzzle gets the basic style.
+            return self.styles.basic.borrow().0.clone();
+        };
+        let seq = &self.sequences[seq_idx];
+        let stage = &seq.stages[stage_idx];
         // unmatched pieces (and fields a matched style leaves unset) fall
         // through the stage fallback, then the sequence fallback, then the
         // builtin "basic" style.
         let fallback = stage.fallback.style().or(&seq.fallback.style());
-        match seq.get_no_fallback(piece, self.selected_stage_idx) {
+        match seq.get_no_fallback(piece, stage_idx) {
             None => fallback,
             Some(style) => style.or(&fallback),
         }
         .unwrap_or(&self.styles.basic.borrow().0)
     }
 
-    fn selected_sequence(&self) -> &Sequence {
-        &self.sequences[self.selected_sequence_idx]
-    }
-
-    fn selected_sequence_mut(&mut self) -> &mut Sequence {
-        &mut self.sequences[self.selected_sequence_idx]
-    }
-
-    fn selected_stage(&self) -> &Stage {
-        &self.sequences[self.selected_sequence_idx].stages[self.selected_stage_idx]
-    }
-
-    fn selected_stage_mut(&mut self) -> &mut Stage {
-        &mut self.sequences[self.selected_sequence_idx].stages[self.selected_stage_idx]
+    fn selected_stage(&self) -> Option<&Stage> {
+        match self.selected_seq_stage {
+            SelectedSeqStage::None => None,
+            SelectedSeqStage::Some { seq, stage } => Some(&self.sequences[seq].stages[stage]),
+        }
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -521,6 +528,15 @@ impl Filters {
             ui.strong("sequences");
         });
 
+        if no_rename_button(
+            ui,
+            "none",
+            "no filtering: show the entire puzzle with the basic style",
+            self.selected_seq_stage == SelectedSeqStage::None,
+        ) {
+            self.selected_seq_stage = SelectedSeqStage::None;
+        }
+
         let n_seqs = self.sequences.len();
         // let mut select_seq_stage: Option<(usize, usize)> = None;
         let mut remove_seq = None;
@@ -534,10 +550,15 @@ impl Filters {
                     true,
                 );
                 let header = state.show_header(ui, |ui| {
-                    if name_button(ui, &mut seq.name, seq_idx == self.selected_sequence_idx) {
-                        // select_seq_stage = Some((seq_idx, 0));
-                        self.selected_sequence_idx = seq_idx;
-                        self.selected_stage_idx = 0;
+                    let seq_selected = matches!(
+                        self.selected_seq_stage,
+                        SelectedSeqStage::Some { seq, .. } if seq == seq_idx
+                    );
+                    if name_button(ui, &mut seq.name, seq_selected) {
+                        self.selected_seq_stage = SelectedSeqStage::Some {
+                            seq: seq_idx,
+                            stage: 0,
+                        };
                     }
                     if n_seqs > 1
                         && ui
@@ -554,15 +575,16 @@ impl Filters {
                     for (stage_idx, stage) in seq.stages.iter_mut().enumerate() {
                         ui.push_id(("stage", stage_idx), |ui| {
                             ui.horizontal(|ui| {
-                                if name_button(
-                                    ui,
-                                    &mut stage.name,
-                                    seq_idx == self.selected_sequence_idx
-                                        && stage_idx == self.selected_stage_idx,
-                                ) {
-                                    // select_seq_stage = Some((seq_idx, stage_idx));
-                                    self.selected_sequence_idx = seq_idx;
-                                    self.selected_stage_idx = stage_idx;
+                                let stage_selected = self.selected_seq_stage
+                                    == SelectedSeqStage::Some {
+                                        seq: seq_idx,
+                                        stage: stage_idx,
+                                    };
+                                if name_button(ui, &mut stage.name, stage_selected) {
+                                    self.selected_seq_stage = SelectedSeqStage::Some {
+                                        seq: seq_idx,
+                                        stage: stage_idx,
+                                    };
                                 }
                                 if n_stages > 1
                                     && ui
@@ -590,8 +612,13 @@ impl Filters {
                     // }
                     if let Some(stage_idx) = remove_stage {
                         seq.stages.remove(stage_idx);
-                        if self.selected_sequence_idx == seq_idx {
-                            self.selected_stage_idx = self.selected_stage_idx.min(
+                        if let SelectedSeqStage::Some {
+                            seq: sel_seq,
+                            stage: sel_stage,
+                        } = &mut self.selected_seq_stage
+                            && *sel_seq == seq_idx
+                        {
+                            *sel_stage = (*sel_stage).min(
                                 seq.stages
                                     .len()
                                     .checked_sub(1)
@@ -613,14 +640,33 @@ impl Filters {
             ));
         }
         if let Some(seq_idx) = append_stage {
-            let mut copy = self.selected_stage().clone();
-            copy.name = format!("{} copy", copy.name);
-            self.sequences[seq_idx].stages.push(copy);
+            let stage = match self.selected_stage() {
+                Some(stage) => {
+                    let mut copy = stage.clone();
+                    copy.name = format!("{} copy", copy.name);
+                    copy
+                }
+                // nothing selected to copy: append a fresh stage.
+                None => Stage::new(
+                    format!("stage {}", self.sequences[seq_idx].stages.len()),
+                    FilterStyle::Basic(Rc::clone(&self.styles.basic)),
+                ),
+            };
+            self.sequences[seq_idx].stages.push(stage);
         }
         if let Some(seq_idx) = remove_seq {
             self.sequences.remove(seq_idx);
-            assert!(!self.sequences.is_empty(), "we can't handle no sequences");
-            self.selected_sequence_idx = self.selected_sequence_idx.min(self.sequences.len() - 1);
+            match &mut self.selected_seq_stage {
+                SelectedSeqStage::None => (),
+                SelectedSeqStage::Some { seq, .. } => {
+                    if *seq == seq_idx {
+                        // the selected sequence is gone.
+                        self.selected_seq_stage = SelectedSeqStage::None;
+                    } else if *seq > seq_idx {
+                        *seq -= 1;
+                    }
+                }
+            }
         }
     }
 
@@ -629,13 +675,22 @@ impl Filters {
     fn ui_stage(&mut self, ui: &mut egui::Ui) {
         let styles = self.styles.clone();
 
+        let SelectedSeqStage::Some {
+            seq: seq_idx,
+            stage: stage_idx,
+        } = self.selected_seq_stage
+        else {
+            ui.strong("no stage selected");
+            ui.weak("the entire puzzle is shown with the basic style");
+            return;
+        };
+
         ui.strong(format!(
             "{} / {}",
-            self.selected_sequence().name,
-            self.selected_stage().name
+            self.sequences[seq_idx].name, self.sequences[seq_idx].stages[stage_idx].name
         ));
 
-        let stage = &mut self.sequences[self.selected_sequence_idx].stages[self.selected_stage_idx];
+        let stage = &mut self.sequences[seq_idx].stages[stage_idx];
 
         let mut remove_term = None;
         for (term_idx, term) in stage.terms.iter_mut().enumerate() {
@@ -690,7 +745,7 @@ impl Filters {
 
         // meaningful from the second stage on; kept visible (disabled) on the
         // first stage so it's discoverable.
-        ui.add_enabled_ui(self.selected_stage_idx > 0, |ui| {
+        ui.add_enabled_ui(stage_idx > 0, |ui| {
             ui.horizontal(|ui| {
                 ui.label("prev stage's pieces get");
                 let label = match &stage.include_prev {
@@ -755,7 +810,7 @@ impl Filters {
             "sequence_fallback",
             "sequence fallback",
             false,
-            &mut self.selected_sequence_mut().fallback,
+            &mut self.sequences[seq_idx].fallback,
             &styles,
         );
     }
@@ -764,7 +819,12 @@ impl Filters {
         ui.strong("builtin styles");
         for style_idx in StyleIdx::BUILTIN {
             let style = self.styles.get(&style_idx);
-            if no_rename_button(ui, &style.name(), self.selected_style_idx == style_idx) {
+            if no_rename_button(
+                ui,
+                &style.name(),
+                "builtin, so unrenamable",
+                self.selected_style_idx == style_idx,
+            ) {
                 self.selected_style_idx = style_idx;
             }
         }
@@ -875,8 +935,7 @@ impl Default for Filters {
             styles,
             selected_style_idx: StyleIdx::Basic,
             sequences,
-            selected_sequence_idx: 0,
-            selected_stage_idx: 0,
+            selected_seq_stage: SelectedSeqStage::None,
         }
     }
 }
@@ -884,12 +943,10 @@ impl Default for Filters {
 /// a `name_button` for a fixed name: same look, but no renaming.
 /// returns whether it was clicked.
 // TODO: this should be centered like `name_button`.
-fn no_rename_button(ui: &mut egui::Ui, name: &str, selected: bool) -> bool {
+fn no_rename_button(ui: &mut egui::Ui, name: &str, hover: &str, selected: bool) -> bool {
     let mut button = egui::Button::new(name).min_size(egui::vec2(110.0, 0.0));
     button = button.selected(selected);
-    ui.add(button)
-        .on_hover_text("builtin, so unrenamable")
-        .clicked()
+    ui.add(button).on_hover_text(hover).clicked()
 }
 
 /// a name as a wide clickable button; right click renames it inline.
@@ -1225,6 +1282,28 @@ mod tests {
     }
 
     #[test]
+    fn no_selection_shows_basic() {
+        let mut filters = Filters::default();
+        // a stage that styles everything at 0.25...
+        let stage = &mut filters.sequences[0].stages[0];
+        stage.terms.clear();
+        stage.terms.push(StageTerm {
+            set: PieceSet {
+                terms: vec![term(&[], &[])],
+            },
+            style: FilterStyle::Literal(PartialStyle {
+                face_opacity: Some(0.25),
+                ..PartialStyle::NONE
+            }),
+        });
+        assert_eq!(filters.style_of(&piece(&[Side::R])).face_opacity, 0.25);
+
+        // ...is ignored once no stage is selected: everything gets basic.
+        filters.selected_seq_stage = SelectedSeqStage::None;
+        assert_eq!(filters.style_of(&piece(&[Side::R])).face_opacity, 1.0);
+    }
+
+    #[test]
     fn earlier_terms_win() {
         let mut filters = Filters::default();
         let basic = FilterStyle::Basic(Rc::clone(&filters.styles.basic));
@@ -1303,7 +1382,7 @@ mod tests {
                 FilterStyle::Basic(Rc::clone(&filters.styles.basic)),
             )
         });
-        filters.selected_stage_idx = 1;
+        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 1 };
 
         let styled = filters.style_of(&piece(&[Side::R]));
         assert_eq!(styled.face_opacity, 0.25);

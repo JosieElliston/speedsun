@@ -6,6 +6,7 @@
     - drag and drop reordering
     - where should the add buttons be?
     - show number of matched pieces, with short circuiting
+    - example cfop filters
 - styles
     - use styles for hovered / selected / blocked.
     - have draw order as part of styles?
