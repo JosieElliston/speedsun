@@ -569,7 +569,7 @@ impl Filters {
                         self.selected_seq_stage,
                         SelectedSeqStage::Some { seq, .. } if seq == seq_idx
                     );
-                    if name_button(ui, &mut seq.name, seq_selected) {
+                    if rename_button(ui, &mut seq.name, seq_selected) {
                         self.selected_seq_stage = SelectedSeqStage::Some {
                             seq: seq_idx,
                             stage: 0,
@@ -595,7 +595,7 @@ impl Filters {
                                         seq: seq_idx,
                                         stage: stage_idx,
                                     };
-                                if name_button(ui, &mut stage.name, stage_selected) {
+                                if rename_button(ui, &mut stage.name, stage_selected) {
                                     self.selected_seq_stage = SelectedSeqStage::Some {
                                         seq: seq_idx,
                                         stage: stage_idx,
@@ -852,7 +852,7 @@ impl Filters {
             ui.push_id(("user_style", user_style_idx), |ui| {
                 let mut style = style.borrow_mut();
                 ui.horizontal(|ui| {
-                    if name_button(
+                    if rename_button(
                         ui,
                         &mut style.name,
                         self.selected_style_idx == StyleIdx::User(user_style_idx),
@@ -966,7 +966,7 @@ fn no_rename_button(ui: &mut egui::Ui, name: &str, hover: &str, selected: bool) 
 
 /// a name as a wide clickable button; right click renames it inline.
 /// returns whether it was left-clicked.
-fn name_button(ui: &mut egui::Ui, name: &mut String, selected: bool) -> bool {
+fn rename_button(ui: &mut egui::Ui, name: &mut String, selected: bool) -> bool {
     let renaming_id = ui.id().with("renaming");
     let fresh_id = renaming_id.with("fresh");
     let renaming = ui
@@ -1273,8 +1273,10 @@ mod tests {
 
     #[test]
     fn style_of_applies_term_and_fallback() {
-        let mut filters = Filters::default();
-        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
+        let mut filters = Filters {
+            selected_seq_stage: SelectedSeqStage::Some { seq: 0, stage: 0 },
+            ..Filters::default()
+        };
         // drop the seeded "all pieces get basic" term: it's complete and
         // earlier terms win per-field, so it would mask the term under test.
         filters.sequences[0].stages[0].terms.clear();
@@ -1299,8 +1301,10 @@ mod tests {
 
     #[test]
     fn no_selection_shows_basic() {
-        let mut filters = Filters::default();
-        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
+        let mut filters = Filters {
+            selected_seq_stage: SelectedSeqStage::Some { seq: 0, stage: 0 },
+            ..Filters::default()
+        };
         // a stage that styles everything at 0.25...
         let stage = &mut filters.sequences[0].stages[0];
         stage.terms.clear();
@@ -1322,8 +1326,10 @@ mod tests {
 
     #[test]
     fn earlier_terms_win() {
-        let mut filters = Filters::default();
-        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
+        let mut filters = Filters {
+            selected_seq_stage: SelectedSeqStage::Some { seq: 0, stage: 0 },
+            ..Filters::default()
+        };
         let basic = FilterStyle::Basic(Rc::clone(&filters.styles.basic));
         let stage = &mut filters.sequences[0].stages[0];
         // terms read top-down like match arms: a narrowed term first, then a
@@ -1352,8 +1358,10 @@ mod tests {
 
     #[test]
     fn fallback_chain() {
-        let mut filters = Filters::default();
-        filters.selected_seq_stage = SelectedSeqStage::Some { seq: 0, stage: 0 };
+        let mut filters = Filters {
+            selected_seq_stage: SelectedSeqStage::Some { seq: 0, stage: 0 },
+            ..Filters::default()
+        };
         let seq = &mut filters.sequences[0];
         // drop the seeded "all pieces get basic" term so that pieces are
         // unmatched and actually reach the fallbacks.
