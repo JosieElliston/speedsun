@@ -5,13 +5,17 @@
 - filters
     - drag and drop reordering
     - where should the add buttons be?
-    - use styles for hovered / selected / blocked.
-    - hovering the + buttons changes the vertical spacing, probably due to the outline.
     - show number of matched pieces, with short circuiting
+- styles
+    - use styles for hovered / selected / blocked.
+    - have draw order as part of styles?
+    - basic's labels should match the partial styles'
 - keybinds
 - macros
+- saved preferences
 - partial solve detection
 - timer
+- sidebar
 - log files
 - fmc timeline
     - operations twist, macro, fork, niss, mark/comment
@@ -19,12 +23,14 @@
 - rendering: gpu / outlines / lighting
 - thing to derive a subpuzzle by deleting pieces
 - refl puzzles
+- drag to rotate should be invariant to window size
 - bug: doing several twists accumulates error and makes it block incorrectly. use approx_collections
 - blocked red flash should also flash the plane that contains the blocked pieces.
 - gizmos
     - should have default shrink <1
     - make "show gizmos" mode look better. outlines? better colors?
     - maybe gizmos should be at the cut depth, not at the faces.
+    - should activate on mouse down, not mouse up. (dragging to rotate can just be on the background)
 - make "hovered / selected pieces" look better. thicker outlines? outlines are opaque to the piece they're from, but not the other pieces, which is a bit weird. shouldn't be the same color as U, maybe change to light gray, or maybe lighting will help. clicking a piece should have an immediate visual effect.
 - you should be able to insert filter between existing ones, not simply at the end.
 - selected piece sets

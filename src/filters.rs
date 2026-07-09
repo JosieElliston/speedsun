@@ -56,7 +56,8 @@ mod style {
     }
     impl CompleteStyle {
         /// what an unfiltered puzzle looks like.
-        /// completes any fields the fallback chain leaves unset.
+        /// the initial value of the builtin "basic" style,
+        /// which completes any fields the fallback chain leaves unset.
         pub const DEFAULT: Self = CompleteStyle {
             face_opacity: 1.0,
             face_color: FaceColor::Sticker,
@@ -64,6 +65,17 @@ mod style {
             outline_size: 1.0,
             outline_color: Color32::BLACK,
         };
+
+        /// the same style with every field `Some`.
+        pub fn to_partial(&self) -> PartialStyle {
+            PartialStyle {
+                face_opacity: Some(self.face_opacity),
+                face_color: Some(self.face_color.clone()),
+                outline_opacity: Some(self.outline_opacity),
+                outline_size: Some(self.outline_size),
+                outline_color: Some(self.outline_color),
+            }
+        }
     }
 
     #[derive(Debug, Clone)]
@@ -111,26 +123,142 @@ mod style {
         }
     }
 
-    /// a factored-out named style. `RefCell` so edits (and renames) in the
-    /// shared-styles UI propagate to everything referencing it.
     #[derive(Debug, Clone)]
-    pub struct SharedStyle {
+    pub struct BasicStyle(pub CompleteStyle);
+
+    #[derive(Debug, Clone)]
+    pub struct HoveredStyle(pub PartialStyle);
+
+    #[derive(Debug, Clone)]
+    pub struct SelectedStyle(pub PartialStyle);
+
+    #[derive(Debug, Clone)]
+    pub struct UserStyle {
         pub name: String,
         pub style: PartialStyle,
     }
 
     #[derive(Debug, Clone)]
-    pub enum BoxPartialStyle {
+    pub enum FilterStyle {
         Literal(PartialStyle),
-        Shared(Rc<RefCell<SharedStyle>>),
+        Basic(Rc<RefCell<BasicStyle>>),
+        Hovered(Rc<RefCell<HoveredStyle>>),
+        Selected(Rc<RefCell<SelectedStyle>>),
+        User(Rc<RefCell<UserStyle>>),
     }
-    impl BoxPartialStyle {
-        pub fn resolve(&self) -> PartialStyle {
+    impl FilterStyle {
+        pub fn name(&self) -> String {
             match self {
-                BoxPartialStyle::Literal(s) => s.clone(),
-                BoxPartialStyle::Shared(s) => s.borrow().style.clone(),
+                FilterStyle::Literal(_) => "literal".to_string(),
+                FilterStyle::Basic(_) => "basic".to_string(),
+                FilterStyle::Hovered(_) => "hovered".to_string(),
+                FilterStyle::Selected(_) => "selected".to_string(),
+                FilterStyle::User(s) => s.borrow().name.clone(),
             }
         }
+
+        pub fn style(&self) -> PartialStyle {
+            match self {
+                FilterStyle::Literal(s) => s.clone(),
+                FilterStyle::Basic(s) => s.borrow().0.to_partial(),
+                FilterStyle::Hovered(s) => s.borrow().0.clone(),
+                FilterStyle::Selected(s) => s.borrow().0.clone(),
+                FilterStyle::User(s) => s.borrow().style.clone(),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Styles {
+        pub basic: Rc<RefCell<BasicStyle>>,
+        pub hovered: Rc<RefCell<HoveredStyle>>,
+        pub selected: Rc<RefCell<SelectedStyle>>,
+        pub user: Vec<Rc<RefCell<UserStyle>>>,
+    }
+    impl Styles {
+        pub fn get(&self, idx: &StyleIdx) -> FilterStyle {
+            match idx {
+                StyleIdx::Basic => FilterStyle::Basic(Rc::clone(&self.basic)),
+                StyleIdx::Hovered => FilterStyle::Hovered(Rc::clone(&self.hovered)),
+                StyleIdx::Selected => FilterStyle::Selected(Rc::clone(&self.selected)),
+                StyleIdx::User(i) => FilterStyle::User(Rc::clone(&self.user[*i])),
+            }
+        }
+    }
+    impl Default for Styles {
+        fn default() -> Self {
+            Self {
+                basic: Rc::new(RefCell::new(BasicStyle(CompleteStyle::DEFAULT))),
+                hovered: Rc::new(RefCell::new(HoveredStyle(PartialStyle {
+                    face_opacity: None,
+                    face_color: None,
+                    outline_opacity: Some(1.0),
+                    outline_size: Some(2.0),
+                    outline_color: Some(Color32::WHITE),
+                }))),
+                selected: Rc::new(RefCell::new(SelectedStyle(PartialStyle {
+                    face_opacity: None,
+                    face_color: None,
+                    outline_opacity: Some(1.0),
+                    outline_size: Some(2.0),
+                    outline_color: Some(Color32::LIGHT_GRAY),
+                }))),
+                user: vec![
+                    Rc::new(RefCell::new(UserStyle {
+                        name: "hidden".to_string(),
+                        style: PartialStyle {
+                            face_opacity: Some(0.05),
+                            face_color: Some(FaceColor::Sticker),
+                            outline_opacity: None,
+                            outline_size: None,
+                            outline_color: None,
+                        },
+                    })),
+                    Rc::new(RefCell::new(UserStyle {
+                        name: "half hidden".to_string(),
+                        style: PartialStyle {
+                            face_opacity: Some(0.2),
+                            face_color: Some(FaceColor::Sticker),
+                            outline_opacity: None,
+                            outline_size: None,
+                            outline_color: None,
+                        },
+                    })),
+                    Rc::new(RefCell::new(UserStyle {
+                        name: "invisible".to_string(),
+                        style: PartialStyle {
+                            face_opacity: Some(0.0),
+                            face_color: None,
+                            outline_opacity: None,
+                            outline_size: None,
+                            outline_color: None,
+                        },
+                    })),
+                    Rc::new(RefCell::new(UserStyle {
+                        name: "gray".to_string(),
+                        style: PartialStyle {
+                            face_opacity: Some(0.2),
+                            face_color: Some(FaceColor::Fixed(Color32::GRAY)),
+                            outline_opacity: None,
+                            outline_size: None,
+                            outline_color: None,
+                        },
+                    })),
+                ],
+            }
+        }
+    }
+
+    /// which style the style editor section edits.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum StyleIdx {
+        Basic,
+        Hovered,
+        Selected,
+        User(usize),
+    }
+    impl StyleIdx {
+        pub const BUILTIN: [StyleIdx; 3] = [StyleIdx::Basic, StyleIdx::Hovered, StyleIdx::Selected];
     }
 }
 
@@ -207,21 +335,21 @@ impl PieceSet {
 #[derive(Debug, Clone)]
 struct StageTerm {
     set: PieceSet,
-    style: BoxPartialStyle,
+    style: FilterStyle,
 }
 impl StageTerm {
-    fn new() -> Self {
+    fn new(style: FilterStyle) -> Self {
         Self {
             set: PieceSet {
                 terms: vec![PieceSetTerm::default()],
             },
-            style: BoxPartialStyle::Literal(PartialStyle::NONE),
+            style,
         }
     }
 
     fn get(&self, piece: &Piece) -> Option<PartialStyle> {
         if self.set.contains(piece) {
-            Some(self.style.resolve())
+            Some(self.style.style())
         } else {
             None
         }
@@ -240,7 +368,7 @@ enum IncludePrev {
     /// if the previous stage matched this piece
     /// (and didn't use the fallbacks), use this style
     /// (otherwise use the fallbacks).
-    Fixed(BoxPartialStyle),
+    Fixed(FilterStyle),
 }
 
 /// each piece scans through `Stage` and takes the first style it matches.
@@ -266,15 +394,15 @@ struct Stage {
     include_prev: IncludePrev,
     /// fields the terms leave unset fall through to this,
     /// then to the sequence fallback.
-    fallback: BoxPartialStyle,
+    fallback: FilterStyle,
 }
 impl Stage {
-    fn new(name: String) -> Self {
+    fn new(name: String, default_style: FilterStyle) -> Self {
         Self {
             name,
-            terms: vec![],
+            terms: vec![StageTerm::new(default_style.clone())],
             include_prev: IncludePrev::Dont,
-            fallback: BoxPartialStyle::Literal(PartialStyle::NONE),
+            fallback: default_style,
         }
     }
 }
@@ -282,17 +410,16 @@ impl Stage {
 #[derive(Debug, Clone)]
 struct Sequence {
     name: String,
-    /// fields the stage fallback leaves unset fall through to this
-    /// (and finally to `CompleteStyle::DEFAULT`).
-    fallback: BoxPartialStyle,
+    /// fields the stage fallback leaves unset fall through to this.
+    fallback: FilterStyle,
     stages: Vec<Stage>,
 }
 impl Sequence {
-    fn new(name: String) -> Self {
+    fn new(name: String, default_style: FilterStyle) -> Self {
         Self {
             name,
-            fallback: BoxPartialStyle::Literal(PartialStyle::NONE),
-            stages: vec![Stage::new("stage 0".to_string())],
+            fallback: default_style.clone(),
+            stages: vec![Stage::new("stage 0".to_string(), default_style.clone())],
         }
     }
 
@@ -305,6 +432,9 @@ impl Sequence {
 
         for term in &stage.terms {
             if let Some(style) = term.get(piece) {
+                // earlier terms win per-field: terms read top-down like
+                // match arms, and later terms only fill what earlier
+                // matching terms left unset.
                 ret = Some(ret.unwrap_or(PartialStyle::NONE).or(&style));
             }
         }
@@ -319,7 +449,7 @@ impl Sequence {
                 }
                 IncludePrev::Fixed(style) => {
                     if self.get_no_fallback(piece, stage_idx - 1).is_some() {
-                        ret = Some(ret.unwrap_or(PartialStyle::NONE).or(&style.resolve()));
+                        ret = Some(ret.unwrap_or(PartialStyle::NONE).or(&style.style()));
                     }
                 }
             }
@@ -331,45 +461,44 @@ impl Sequence {
 
 #[derive(Debug, Clone)]
 pub struct Filters {
-    /// the pool of factored-out styles offered by the style pickers.
-    /// deleting one here doesn't break existing references to it;
-    /// it just stops being offered for new uses.
-    shared_styles: Vec<Rc<RefCell<SharedStyle>>>,
+    styles: Styles,
+    /// the style shown in the style editor section.
+    selected_style_idx: StyleIdx,
     sequences: Vec<Sequence>,
-    sequence_idx: usize,
-    stage_idx: usize,
+    selected_sequence_idx: usize,
+    selected_stage_idx: usize,
 }
 impl Filters {
     // TODO: bake the prev stage search into the stage to make this constant time
     // (rather than linear) (in the number of stages) (it'll still be linear in the number of terms).
     pub fn style_of(&self, piece: &Piece) -> CompleteStyle {
         let seq = &self.selected_sequence();
-        let stage = &seq.stages[self.stage_idx];
+        let stage = &seq.stages[self.selected_stage_idx];
         // unmatched pieces (and fields a matched style leaves unset) fall
         // through the stage fallback, then the sequence fallback, then the
-        // hardcoded default.
-        let fallback = stage.fallback.resolve().or(&seq.fallback.resolve());
-        match seq.get_no_fallback(piece, self.stage_idx) {
+        // builtin "basic" style.
+        let fallback = stage.fallback.style().or(&seq.fallback.style());
+        match seq.get_no_fallback(piece, self.selected_stage_idx) {
             None => fallback,
             Some(style) => style.or(&fallback),
         }
-        .unwrap_or(&CompleteStyle::DEFAULT)
+        .unwrap_or(&self.styles.basic.borrow().0)
     }
 
     fn selected_sequence(&self) -> &Sequence {
-        &self.sequences[self.sequence_idx]
+        &self.sequences[self.selected_sequence_idx]
     }
 
     fn selected_sequence_mut(&mut self) -> &mut Sequence {
-        &mut self.sequences[self.sequence_idx]
+        &mut self.sequences[self.selected_sequence_idx]
     }
 
     fn selected_stage(&self) -> &Stage {
-        &self.sequences[self.sequence_idx].stages[self.stage_idx]
+        &self.sequences[self.selected_sequence_idx].stages[self.selected_stage_idx]
     }
 
     fn selected_stage_mut(&mut self) -> &mut Stage {
-        &mut self.sequences[self.sequence_idx].stages[self.stage_idx]
+        &mut self.sequences[self.selected_sequence_idx].stages[self.selected_stage_idx]
     }
 
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -379,7 +508,11 @@ impl Filters {
         ui.separator();
         self.ui_stage(ui);
         ui.separator();
-        self.ui_shared_styles(ui);
+        self.ui_builtin_styles(ui);
+        ui.separator();
+        self.ui_user_styles(ui);
+        ui.separator();
+        self.ui_edit_styles(ui);
     }
 
     /// section 1: the sequences (collapsible, containing their stages), by name.
@@ -401,10 +534,10 @@ impl Filters {
                     true,
                 );
                 let header = state.show_header(ui, |ui| {
-                    if name_button(ui, &mut seq.name, seq_idx == self.sequence_idx) {
+                    if name_button(ui, &mut seq.name, seq_idx == self.selected_sequence_idx) {
                         // select_seq_stage = Some((seq_idx, 0));
-                        self.sequence_idx = seq_idx;
-                        self.stage_idx = 0;
+                        self.selected_sequence_idx = seq_idx;
+                        self.selected_stage_idx = 0;
                     }
                     if n_seqs > 1
                         && ui
@@ -424,11 +557,12 @@ impl Filters {
                                 if name_button(
                                     ui,
                                     &mut stage.name,
-                                    seq_idx == self.sequence_idx && stage_idx == self.stage_idx,
+                                    seq_idx == self.selected_sequence_idx
+                                        && stage_idx == self.selected_stage_idx,
                                 ) {
                                     // select_seq_stage = Some((seq_idx, stage_idx));
-                                    self.sequence_idx = seq_idx;
-                                    self.stage_idx = stage_idx;
+                                    self.selected_sequence_idx = seq_idx;
+                                    self.selected_stage_idx = stage_idx;
                                 }
                                 if n_stages > 1
                                     && ui
@@ -456,9 +590,13 @@ impl Filters {
                     // }
                     if let Some(stage_idx) = remove_stage {
                         seq.stages.remove(stage_idx);
-                        if self.sequence_idx == seq_idx {
-                            assert!(!seq.stages.is_empty(), "we can't handle empty sequences");
-                            self.stage_idx = self.stage_idx.min(seq.stages.len() - 1);
+                        if self.selected_sequence_idx == seq_idx {
+                            self.selected_stage_idx = self.selected_stage_idx.min(
+                                seq.stages
+                                    .len()
+                                    .checked_sub(1)
+                                    .expect("we can't handle empty sequences"),
+                            );
                         }
                     }
                 });
@@ -469,25 +607,27 @@ impl Filters {
             .on_hover_text("append a new sequence")
             .clicked()
         {
-            self.sequences
-                .push(Sequence::new(format!("sequence {}", self.sequences.len())));
+            self.sequences.push(Sequence::new(
+                format!("sequence {}", self.sequences.len()),
+                FilterStyle::Basic(Rc::clone(&self.styles.basic)),
+            ));
         }
         if let Some(seq_idx) = append_stage {
             let mut copy = self.selected_stage().clone();
-            copy.name = format!("stage {}", self.sequences[seq_idx].stages.len());
+            copy.name = format!("{} copy", copy.name);
             self.sequences[seq_idx].stages.push(copy);
         }
         if let Some(seq_idx) = remove_seq {
             self.sequences.remove(seq_idx);
             assert!(!self.sequences.is_empty(), "we can't handle no sequences");
-            self.sequence_idx = self.sequence_idx.min(self.sequences.len() - 1);
+            self.selected_sequence_idx = self.selected_sequence_idx.min(self.sequences.len() - 1);
         }
     }
 
     /// section 2: the contents of the selected stage,
     /// in processing order: terms, prev stage, stage fallback, sequence fallback.
     fn ui_stage(&mut self, ui: &mut egui::Ui) {
-        let shared = self.shared_styles.clone();
+        let styles = self.styles.clone();
 
         ui.strong(format!(
             "{} / {}",
@@ -495,8 +635,7 @@ impl Filters {
             self.selected_stage().name
         ));
 
-        // let stage = self.selected_stage_mut();
-        let stage = &mut self.sequences[self.sequence_idx].stages[self.stage_idx];
+        let stage = &mut self.sequences[self.selected_sequence_idx].stages[self.selected_stage_idx];
 
         let mut remove_term = None;
         for (term_idx, term) in stage.terms.iter_mut().enumerate() {
@@ -519,7 +658,7 @@ impl Filters {
                         ui.push_id(("set_row", row_idx), |ui| {
                             ui.horizontal(|ui| {
                                 for side in Side::ALL {
-                                    side_state_ui(ui, side, set_term);
+                                    ui_piece_set_term_side(ui, side, set_term);
                                 }
                                 if n_rows > 1 && ui.button("🗑️").clicked() {
                                     remove_row = Some(row_idx);
@@ -530,23 +669,28 @@ impl Filters {
                     if let Some(row_idx) = remove_row {
                         term.set.terms.remove(row_idx);
                     }
-                    if ui.button("+").clicked() {
+                    if ui.button("+ piece set term").clicked() {
                         term.set.terms.push(PieceSetTerm::default());
                     }
-                    box_style_ui(ui, "term_style", "style", true, &mut term.style, &shared);
+                    // ui.label("show 68 pieces with");
+                    ui_filter_style(ui, "term_style", "style", true, &mut term.style, &styles);
                 });
             });
         }
         if let Some(term_idx) = remove_term {
             stage.terms.remove(term_idx);
         }
-        if ui.button("+ term").clicked() {
-            stage.terms.push(StageTerm::new());
+        if ui.button("+ stage term").clicked() {
+            stage
+                .terms
+                .push(StageTerm::new(FilterStyle::Basic(Rc::clone(
+                    &self.styles.basic,
+                ))));
         }
 
         // meaningful from the second stage on; kept visible (disabled) on the
         // first stage so it's discoverable.
-        ui.add_enabled_ui(self.stage_idx > 0, |ui| {
+        ui.add_enabled_ui(self.selected_stage_idx > 0, |ui| {
             ui.horizontal(|ui| {
                 ui.label("prev stage's pieces get");
                 let label = match &stage.include_prev {
@@ -584,90 +728,168 @@ impl Filters {
                             && !matches!(stage.include_prev, IncludePrev::Fixed(_))
                         {
                             stage.include_prev =
-                                IncludePrev::Fixed(BoxPartialStyle::Literal(PartialStyle::NONE));
+                                IncludePrev::Fixed(FilterStyle::Literal(PartialStyle::NONE));
                         }
                     });
             });
             if let IncludePrev::Fixed(style) = &mut stage.include_prev {
                 // indented: the style belongs to the dropdown's choice.
                 ui.indent("include_prev_style", |ui| {
-                    box_style_ui(ui, "include_prev_style", "style", true, style, &shared);
+                    ui_filter_style(ui, "include_prev_style", "style", true, style, &self.styles);
                 });
             }
         });
 
-        box_style_ui(
+        ui_filter_style(
             ui,
             "stage_fallback",
             "stage fallback",
             false,
             &mut stage.fallback,
-            &shared,
+            &styles,
         );
         // sequence-level, not stage-level.
         ui.separator();
-        box_style_ui(
+        ui_filter_style(
             ui,
             "sequence_fallback",
             "sequence fallback",
             false,
             &mut self.selected_sequence_mut().fallback,
-            &shared,
+            &styles,
         );
     }
 
-    /// section 3: the pool of shared styles.
-    fn ui_shared_styles(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.strong("shared styles");
-            if ui.button("+").clicked() {
-                self.shared_styles.push(Rc::new(RefCell::new(SharedStyle {
-                    name: format!("style {}", self.shared_styles.len()),
-                    style: PartialStyle::NONE,
-                })));
+    fn ui_builtin_styles(&mut self, ui: &mut egui::Ui) {
+        ui.strong("builtin styles");
+        for style_idx in StyleIdx::BUILTIN {
+            let style = self.styles.get(&style_idx);
+            if no_rename_button(ui, &style.name(), self.selected_style_idx == style_idx) {
+                self.selected_style_idx = style_idx;
             }
-        });
+        }
+    }
+
+    fn ui_user_styles(&mut self, ui: &mut egui::Ui) {
+        ui.strong("user styles");
         let mut remove = None;
-        for (i, style) in self.shared_styles.iter().enumerate() {
-            ui.push_id(("shared_style", i), |ui| {
+        for (user_style_idx, style) in self.styles.user.iter().enumerate() {
+            ui.push_id(("user_style", user_style_idx), |ui| {
                 let mut style = style.borrow_mut();
-                let state = CollapsingState::load_with_default_open(
-                    ui.ctx(),
-                    ui.make_persistent_id("shared_style"),
-                    false,
-                );
-                let header = state.show_header(ui, |ui| {
-                    name_button(ui, &mut style.name, false);
-                    if ui.button("🗑️").clicked() {
-                        remove = Some(i);
+                ui.horizontal(|ui| {
+                    if name_button(
+                        ui,
+                        &mut style.name,
+                        self.selected_style_idx == StyleIdx::User(user_style_idx),
+                    ) {
+                        self.selected_style_idx = StyleIdx::User(user_style_idx);
+                    }
+                    if ui
+                        .button("🗑️")
+                        .on_hover_text(format!("delete {}", style.name))
+                        .clicked()
+                    {
+                        remove = Some(user_style_idx);
                     }
                 });
-                header.body(|ui| partial_style_ui(ui, &mut style.style));
             });
         }
-        if let Some(i) = remove {
-            self.shared_styles.remove(i);
+        if let Some(user_style_idx) = remove {
+            self.styles.user.remove(user_style_idx);
+            if let StyleIdx::User(selected_user_style_idx) = self.selected_style_idx
+                && selected_user_style_idx > self.styles.user.len()
+            {
+                self.selected_style_idx = if self.styles.user.is_empty() {
+                    StyleIdx::Basic
+                } else {
+                    StyleIdx::User(
+                        self.styles
+                            .user
+                            .len()
+                            .checked_sub(1)
+                            .expect("we just checked that it's not empty"),
+                    )
+                };
+            }
+        }
+        if ui
+            .button("+ style")
+            .on_hover_text("append a copy of the selected style")
+            .clicked()
+        {
+            let copy = match self.selected_style_idx {
+                StyleIdx::Basic => UserStyle {
+                    name: "basic copy".to_string(),
+                    style: self.styles.basic.borrow().0.to_partial(),
+                },
+                StyleIdx::Hovered => UserStyle {
+                    name: "hovered copy".to_string(),
+                    style: self.styles.hovered.borrow().0.clone(),
+                },
+                StyleIdx::Selected => UserStyle {
+                    name: "selected copy".to_string(),
+                    style: self.styles.selected.borrow().0.clone(),
+                },
+                StyleIdx::User(i) => UserStyle {
+                    name: format!("{} copy", self.styles.user[i].borrow().name),
+                    style: self.styles.user[i].borrow().style.clone(),
+                },
+            };
+            self.styles.user.push(Rc::new(RefCell::new(copy)));
+        }
+    }
+
+    fn ui_edit_styles(&mut self, ui: &mut egui::Ui) {
+        match self.selected_style_idx {
+            StyleIdx::Basic => {
+                let mut style = self.styles.basic.borrow_mut();
+                ui.strong("basic");
+                ui_complete_style(ui, &mut style.0);
+            }
+            StyleIdx::Hovered => {
+                let mut style = self.styles.hovered.borrow_mut();
+                ui.strong("hovered");
+                ui_partial_style(ui, &mut style.0);
+            }
+            StyleIdx::Selected => {
+                let mut style = self.styles.selected.borrow_mut();
+                ui.strong("selected");
+                ui_partial_style(ui, &mut style.0);
+            }
+            StyleIdx::User(i) => {
+                let mut style = self.styles.user[i].borrow_mut();
+                ui.strong(&style.name);
+                ui_partial_style(ui, &mut style.style);
+            }
         }
     }
 }
 impl Default for Filters {
     fn default() -> Self {
+        let styles = Styles::default();
+        let sequences = vec![Sequence::new(
+            "sequence 0".to_string(),
+            FilterStyle::Basic(Rc::clone(&styles.basic)),
+        )];
         Self {
-            shared_styles: vec![Rc::new(RefCell::new(SharedStyle {
-                name: "dimmed".to_string(),
-                style: PartialStyle {
-                    face_opacity: Some(0.15),
-                    face_color: None,
-                    outline_opacity: Some(0.15),
-                    outline_size: None,
-                    outline_color: None,
-                },
-            }))],
-            sequences: vec![Sequence::new("sequence 0".to_string())],
-            sequence_idx: 0,
-            stage_idx: 0,
+            styles,
+            selected_style_idx: StyleIdx::Basic,
+            sequences,
+            selected_sequence_idx: 0,
+            selected_stage_idx: 0,
         }
     }
+}
+
+/// a `name_button` for a fixed name: same look, but no renaming.
+/// returns whether it was clicked.
+// TODO: this should be centered like `name_button`.
+fn no_rename_button(ui: &mut egui::Ui, name: &str, selected: bool) -> bool {
+    let mut button = egui::Button::new(name).min_size(egui::vec2(110.0, 0.0));
+    button = button.selected(selected);
+    ui.add(button)
+        .on_hover_text("builtin, so unrenamable")
+        .clicked()
 }
 
 /// a name as a wide clickable button; right click renames it inline.
@@ -689,9 +911,7 @@ fn name_button(ui: &mut egui::Ui, name: &mut String, selected: bool) -> bool {
         false
     } else {
         let mut button = egui::Button::new(name.as_str()).min_size(egui::vec2(110.0, 0.0));
-        if selected {
-            button = button.fill(ui.visuals().selection.bg_fill);
-        }
+        button = button.selected(selected);
         let response = ui.add(button).on_hover_text("right click to rename");
         if response.secondary_clicked() {
             ui.data_mut(|d| d.insert_temp(renaming_id, true));
@@ -703,7 +923,7 @@ fn name_button(ui: &mut egui::Ui, name: &mut String, selected: bool) -> bool {
 
 /// tri-state (may have / must have / must not have) button for one side.
 /// left click cycles forward, right click backward.
-fn side_state_ui(ui: &mut egui::Ui, side: Side, term: &mut PieceSetTerm) {
+fn ui_piece_set_term_side(ui: &mut egui::Ui, side: Side, term: &mut PieceSetTerm) {
     #[derive(Clone, Copy, PartialEq)]
     enum SideState {
         May,
@@ -779,15 +999,13 @@ fn side_state_ui(ui: &mut egui::Ui, side: Side, term: &mut PieceSetTerm) {
     }
 }
 
-/// picker between a literal style (edited inline, collapsible) and a shared
-/// style (picked by name, edited in the shared-styles section).
-fn box_style_ui(
+fn ui_filter_style(
     ui: &mut egui::Ui,
     id_salt: &str,
     label: &str,
     default_open: bool,
-    style: &mut BoxPartialStyle,
-    shared: &[Rc<RefCell<SharedStyle>>],
+    style: &mut FilterStyle,
+    styles: &Styles,
 ) {
     let state = CollapsingState::load_with_default_open(
         ui.ctx(),
@@ -796,34 +1014,50 @@ fn box_style_ui(
     );
     let header = state.show_header(ui, |ui| {
         ui.label(label);
-        let selected_text = match style {
-            BoxPartialStyle::Literal(_) => "literal".to_string(),
-            BoxPartialStyle::Shared(s) => s.borrow().name.clone(),
-        };
+        let selected_text = style.name();
         egui::ComboBox::from_id_salt(id_salt)
             .selected_text(selected_text)
             .show_ui(ui, |ui| {
-                let is_literal = matches!(style, BoxPartialStyle::Literal(_));
+                let is_literal = matches!(style, FilterStyle::Literal(_));
                 if ui.selectable_label(is_literal, "literal").clicked() && !is_literal {
-                    // seed the literal with the shared style's current contents.
-                    *style = BoxPartialStyle::Literal(style.resolve());
+                    *style = FilterStyle::Literal(PartialStyle::NONE);
                 }
-                for s in shared {
-                    let is_this =
-                        matches!(style, BoxPartialStyle::Shared(cur) if Rc::ptr_eq(cur, s));
+                let is_basic: bool = matches!(style, FilterStyle::Basic(_));
+                if ui.selectable_label(is_basic, "basic").clicked() {
+                    *style = FilterStyle::Basic(Rc::clone(&styles.basic));
+                }
+                let is_hovered = matches!(style, FilterStyle::Hovered(_));
+                if ui.selectable_label(is_hovered, "hovered").clicked() {
+                    *style = FilterStyle::Hovered(Rc::clone(&styles.hovered));
+                }
+                let is_selected = matches!(style, FilterStyle::Selected(_));
+                if ui.selectable_label(is_selected, "selected").clicked() {
+                    *style = FilterStyle::Selected(Rc::clone(&styles.selected));
+                }
+                for s in &styles.user {
+                    let is_this = matches!(style, FilterStyle::User(cur) if Rc::ptr_eq(cur, s));
                     if ui
                         .selectable_label(is_this, s.borrow().name.clone())
                         .clicked()
                     {
-                        *style = BoxPartialStyle::Shared(Rc::clone(s));
+                        *style = FilterStyle::User(Rc::clone(s));
                     }
                 }
             });
     });
     header.body(|ui| match style {
-        BoxPartialStyle::Literal(style) => partial_style_ui(ui, style),
-        BoxPartialStyle::Shared(_) => {
-            ui.weak("edit in the shared styles section");
+        FilterStyle::Literal(style) => ui_partial_style(ui, style),
+        FilterStyle::Basic(_) => {
+            ui.weak("edit in the builtin styles section");
+        }
+        FilterStyle::Hovered(_) => {
+            ui.weak("edit in the builtin styles section");
+        }
+        FilterStyle::Selected(_) => {
+            ui.weak("edit in the builtin styles section");
+        }
+        FilterStyle::User(_) => {
+            ui.weak("edit in the user styles section");
         }
     });
 }
@@ -867,7 +1101,7 @@ fn face_color_ui(ui: &mut egui::Ui, face_color: &mut FaceColor) {
     }
 }
 
-fn partial_style_ui(ui: &mut egui::Ui, style: &mut PartialStyle) {
+fn ui_partial_style(ui: &mut egui::Ui, style: &mut PartialStyle) {
     opt_row(ui, "face opacity", &mut style.face_opacity, 1.0, |ui, v| {
         ui.add(egui::Slider::new(v, 0.0..=1.0));
     });
@@ -899,6 +1133,30 @@ fn partial_style_ui(ui: &mut egui::Ui, style: &mut PartialStyle) {
             ui.color_edit_button_srgba(v);
         },
     );
+}
+
+/// like `ui_partial_style`, but for a complete style: every field always set.
+fn ui_complete_style(ui: &mut egui::Ui, style: &mut CompleteStyle) {
+    ui.horizontal(|ui| {
+        ui.label("face opacity");
+        ui.add(egui::Slider::new(&mut style.face_opacity, 0.0..=1.0));
+    });
+    ui.horizontal(|ui| {
+        ui.label("face color");
+        face_color_ui(ui, &mut style.face_color);
+    });
+    ui.horizontal(|ui| {
+        ui.label("outline opacity");
+        ui.add(egui::Slider::new(&mut style.outline_opacity, 0.0..=1.0));
+    });
+    ui.horizontal(|ui| {
+        ui.label("outline size");
+        ui.add(egui::Slider::new(&mut style.outline_size, 0.0..=4.0));
+    });
+    ui.horizontal(|ui| {
+        ui.label("outline color");
+        ui.color_edit_button_srgba(&mut style.outline_color);
+    });
 }
 
 #[cfg(test)]
@@ -944,11 +1202,14 @@ mod tests {
     #[test]
     fn style_of_applies_term_and_fallback() {
         let mut filters = Filters::default();
+        // drop the seeded "all pieces get basic" term: it's complete and
+        // earlier terms win per-field, so it would mask the term under test.
+        filters.sequences[0].stages[0].terms.clear();
         filters.sequences[0].stages[0].terms.push(StageTerm {
             set: PieceSet {
                 terms: vec![term(&[Side::R], &[])],
             },
-            style: BoxPartialStyle::Literal(PartialStyle {
+            style: FilterStyle::Literal(PartialStyle {
                 face_opacity: Some(0.25),
                 ..PartialStyle::NONE
             }),
@@ -964,15 +1225,47 @@ mod tests {
     }
 
     #[test]
+    fn earlier_terms_win() {
+        let mut filters = Filters::default();
+        let basic = FilterStyle::Basic(Rc::clone(&filters.styles.basic));
+        let stage = &mut filters.sequences[0].stages[0];
+        // terms read top-down like match arms: a narrowed term first, then a
+        // complete catch-all below it.
+        stage.terms.clear();
+        stage.terms.push(StageTerm {
+            set: PieceSet {
+                terms: vec![term(&[Side::R], &[])],
+            },
+            style: FilterStyle::Literal(PartialStyle {
+                face_opacity: Some(0.25),
+                ..PartialStyle::NONE
+            }),
+        });
+        stage.terms.push(StageTerm::new(basic));
+
+        // the earlier term wins where it matches, even though the later
+        // catch-all is complete; its unset fields fall to the catch-all.
+        let styled = filters.style_of(&piece(&[Side::R]));
+        assert_eq!(styled.face_opacity, 0.25);
+        assert_eq!(styled.outline_opacity, 1.0);
+        // pieces the earlier term doesn't match get the catch-all.
+        let unmatched = filters.style_of(&piece(&[Side::L]));
+        assert_eq!(unmatched.face_opacity, 1.0);
+    }
+
+    #[test]
     fn fallback_chain() {
         let mut filters = Filters::default();
         let seq = &mut filters.sequences[0];
-        seq.fallback = BoxPartialStyle::Literal(PartialStyle {
+        // drop the seeded "all pieces get basic" term so that pieces are
+        // unmatched and actually reach the fallbacks.
+        seq.stages[0].terms.clear();
+        seq.fallback = FilterStyle::Literal(PartialStyle {
             face_opacity: Some(0.5),
             outline_size: Some(2.0),
             ..PartialStyle::NONE
         });
-        seq.stages[0].fallback = BoxPartialStyle::Literal(PartialStyle {
+        seq.stages[0].fallback = FilterStyle::Literal(PartialStyle {
             face_opacity: Some(0.25),
             ..PartialStyle::NONE
         });
@@ -990,20 +1283,27 @@ mod tests {
     fn include_prev_carries_the_prev_stage_style() {
         let mut filters = Filters::default();
         let seq = &mut filters.sequences[0];
+        // drop the seeded "all pieces get basic" terms (here and in stage 1
+        // below): they're complete and would mask the styles under test.
+        seq.stages[0].terms.clear();
         seq.stages[0].terms.push(StageTerm {
             set: PieceSet {
                 terms: vec![term(&[Side::R], &[])],
             },
-            style: BoxPartialStyle::Literal(PartialStyle {
+            style: FilterStyle::Literal(PartialStyle {
                 face_opacity: Some(0.25),
                 ..PartialStyle::NONE
             }),
         });
         seq.stages.push(Stage {
             include_prev: IncludePrev::Prev,
-            ..Stage::new("stage 1".to_string())
+            terms: vec![],
+            ..Stage::new(
+                "stage 1".to_string(),
+                FilterStyle::Basic(Rc::clone(&filters.styles.basic)),
+            )
         });
-        filters.stage_idx = 1;
+        filters.selected_stage_idx = 1;
 
         let styled = filters.style_of(&piece(&[Side::R]));
         assert_eq!(styled.face_opacity, 0.25);
