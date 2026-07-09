@@ -421,12 +421,20 @@ impl PuzzleView {
                 self.gizmo_hit(xv, yv)
             })
         };
-        // Handle clicks before advance_twist so the twist starts this frame.
+        // Handle presses before advance_twist so the twist starts this frame.
         if let Some((side, front)) = gizmo_hover {
-            // left click: CCW (like the `'` buttons); right click: CW.
-            let multiplicity = if response.clicked() {
+            // twist on mouse down (not click) for a snappier feel; dragging the
+            // background still rotates the view. left: CCW (like the `'`
+            // buttons); right: CW.
+            let (primary, secondary) = ctx.input(|i| {
+                (
+                    i.pointer.button_pressed(egui::PointerButton::Primary),
+                    i.pointer.button_pressed(egui::PointerButton::Secondary),
+                )
+            });
+            let multiplicity = if primary {
                 Some(-1)
-            } else if response.secondary_clicked() {
+            } else if secondary {
                 Some(1)
             } else {
                 None
