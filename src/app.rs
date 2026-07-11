@@ -12,10 +12,14 @@ pub struct App {
 }
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let render_state = cc
+            .wgpu_render_state
+            .clone()
+            .expect("main requests the wgpu renderer");
         let puzzle = Arc::new(Mutex::new(PuzzleState::new()));
         Self {
             puzzle: Arc::clone(&puzzle),
-            puzzle_view: PuzzleView::new(Arc::clone(&puzzle)),
+            puzzle_view: PuzzleView::new(Arc::clone(&puzzle), render_state),
             layer: 0,
             filters: Filters::default(),
         }

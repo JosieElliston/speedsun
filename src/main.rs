@@ -2,6 +2,7 @@ mod app;
 mod filters;
 mod puzzle_state;
 mod puzzle_view;
+mod render;
 
 fn main() -> Result<(), eframe::Error> {
     // let puzzle = puzzle::MixupCube::new();
@@ -25,7 +26,11 @@ fn main() -> Result<(), eframe::Error> {
 
     eframe::run_native(
         "speedsun",
-        eframe::NativeOptions::default(),
+        eframe::NativeOptions {
+            // the puzzle is rendered with wgpu directly (see render.rs).
+            renderer: eframe::Renderer::Wgpu,
+            ..Default::default()
+        },
         Box::new(|cc| Ok(Box::new(app::App::new(cc)))),
     )
 }

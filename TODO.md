@@ -36,6 +36,7 @@
 
 - undoable commands?
 - what commands should go in the log file?
+    - a design goal is that you should be able to nearly reconstruct a screen recording from the log file (tho some mouse movement stuff maybe should be dropped)
 
 ### command list
 

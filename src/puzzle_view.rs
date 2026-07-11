@@ -5,12 +5,15 @@ use std::{
 };
 
 use cgmath::{InnerSpace, Rotation, Rotation3};
-use eframe::egui::{self, mutex::Mutex};
-use euc::{Pipeline, Target, buffer::Buffer2d, rasterizer};
+use eframe::{
+    egui::{self, mutex::Mutex},
+    egui_wgpu,
+};
 
 use crate::{
     filters::{FaceColor, Filters},
     puzzle_state::*,
+    render::{FrameInput, GpuRenderer, Vertex},
 };
 
 /// below this many frames per twist, animation progress is frame-indexed
@@ -117,11 +120,11 @@ pub struct PuzzleView {
     /// when clicking the back of a gizmo face, input the twist as seen from
     /// the camera (mirrored) instead of as defined from outside the face.
     reverse_backface_twists: bool,
-    /// the software-rendered frame, re-uploaded to the GPU each draw.
-    texture: Option<egui::TextureHandle>,
+    /// the wgpu pipelines and render targets the frame is drawn with.
+    gpu: GpuRenderer,
 }
 impl PuzzleView {
-    pub fn new(puzzle: Arc<Mutex<PuzzleState>>) -> Self {
+    pub fn new(puzzle: Arc<Mutex<PuzzleState>>, render_state: egui_wgpu::RenderState) -> Self {
         Self {
             puzzle,
             rot: Rot::from_angle_x(cgmath::Deg(20.0)) * Rot::from_angle_y(cgmath::Deg(-30.0)),
@@ -142,7 +145,7 @@ impl PuzzleView {
             show_gizmos: false,
             gizmo_shrink: 1.0,
             reverse_backface_twists: true,
-            texture: None,
+            gpu: GpuRenderer::new(render_state),
         }
     }
 
@@ -484,8 +487,8 @@ impl PuzzleView {
 
         // Correct visibility needs a per-pixel depth buffer, not a per-sticker
         // depth sort: sorting can't resolve interpenetrating or cyclically
-        // overlapping polygons. We rasterize every sticker triangle on the CPU
-        // with `euc`, which does per-pixel depth testing, then blit the result.
+        // overlapping polygons. Every sticker triangle is rendered with wgpu
+        // (depth-tested) into a texture that's then drawn as an egui image.
         let mut vertices: Vec<Vertex> = Vec::new();
         // stickers whose filter style makes them translucent; rendered as a
         // stylized-transparency overlay instead of into the base pass.
@@ -560,12 +563,12 @@ impl PuzzleView {
             let face_a = style.face_opacity.clamp(0.0, 1.0);
             let outline_a = style.outline_opacity.clamp(0.0, 1.0);
             let outline_w = self.outline_width * style.outline_size;
-            let outline_rgba = (
+            let outline_rgba = [
                 style.outline_color.r() as f32 / 255.0,
                 style.outline_color.g() as f32 / 255.0,
                 style.outline_color.b() as f32 / 255.0,
                 outline_a,
-            );
+            ];
             // a face_opacity-0 piece with a visible outline draws as wireframe.
             let visible = face_a > 0.0 || (outline_a > 0.0 && outline_w > 0.0);
 
@@ -585,12 +588,12 @@ impl PuzzleView {
                         .map_or(egui::Color32::GRAY, |side| side.color()),
                     FaceColor::Fixed(color) => *color,
                 };
-                let face_rgba = (
+                let face_rgba = [
                     color.r() as f32 / 255.0,
                     color.g() as f32 / 255.0,
                     color.b() as f32 / 255.0,
                     face_a,
-                );
+                ];
 
                 // The sticker's centroid (local space) is the point sticker_shrink
                 // shrinks it toward. A sticker with no vertices draws nothing.
@@ -608,8 +611,8 @@ impl PuzzleView {
                 // blocked pieces flash even where filters hide them: the flash
                 // is what explains why the twist was rejected.
                 if flashed {
-                    const RED: Rgba = (1.0, 0.0, 0.0, 1.0);
-                    const BLACK: Rgba = (0.0, 0.0, 0.0, 1.0);
+                    const RED: Rgba = [1.0, 0.0, 0.0, 1.0];
+                    const BLACK: Rgba = [0.0, 0.0, 0.0, 1.0];
                     push_fan(
                         &mut flash_vertices,
                         &clip,
@@ -635,52 +638,6 @@ impl PuzzleView {
             }
         }
 
-        let sticker_pipeline = StickerPipeline;
-        let mut color_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
-        let mut depth_buf = Buffer2d::new([w, h], 1.0f32);
-        rasterize(
-            &sticker_pipeline,
-            &vertices,
-            &mut color_buf,
-            &mut depth_buf,
-            self.backface_culling,
-        );
-
-        // Stylized-transparency pass for the filter-translucent stickers:
-        // rendered opaquely among themselves into their own buffer (nearest
-        // surface wins, no fog-like buildup), keeping the base pass's depth
-        // buffer so opaque geometry in front still occludes them, then
-        // composited per pixel by their own alpha.
-        if !overlay_vertices.is_empty() {
-            let mut over_buf = Buffer2d::new([w, h], egui::Color32::TRANSPARENT);
-            rasterize(
-                &sticker_pipeline,
-                &overlay_vertices,
-                &mut over_buf,
-                &mut depth_buf,
-                self.backface_culling,
-            );
-            blend_overlay(&mut color_buf, &over_buf);
-        }
-
-        if let Some((_, strength)) = &flash
-            && !flash_vertices.is_empty()
-        {
-            // The fresh depth buffer puts the red on top of all normal
-            // geometry (it still self-occludes, though that's invisible in
-            // a solid color).
-            let base = color_buf.as_ref().to_vec();
-            depth_buf.clear(1.0);
-            rasterize(
-                &sticker_pipeline,
-                &flash_vertices,
-                &mut color_buf,
-                &mut depth_buf,
-                self.backface_culling,
-            );
-            blend_layers(&base, &mut color_buf, *strength);
-        }
-
         // Twist gizmos: transparent blue on top of everything, or red where
         // the twist a face inputs is currently blocked. Normally only the
         // hovered face is drawn; show_gizmos draws all of them, with the
@@ -690,77 +647,61 @@ impl PuzzleView {
         } else {
             gizmo_hover.iter().map(|&(side, _)| side).collect()
         };
-        if !gizmo_faces.is_empty() {
-            let mut gizmo_vertices: Vec<Vertex> = Vec::new();
-            for side in gizmo_faces {
-                let blocked = puzzle
-                    .twist_pieces(Twist {
-                        side,
-                        layer,
-                        multiplicity: 1,
-                    })
-                    .is_err();
-                let mut rgb = if blocked {
-                    (1.0, 0.0, 0.0)
-                } else {
-                    (0.3, 0.5, 1.0)
-                };
-                let hovered = gizmo_hover.is_some_and(|(s, _)| s == side);
-                if !hovered {
-                    const DIM: f32 = 0.4;
-                    rgb = (rgb.0 * DIM, rgb.1 * DIM, rgb.2 * DIM);
-                }
-                let clip: Vec<[f32; 4]> = self
-                    .gizmo_quad(side)
-                    .iter()
-                    .map(|&v| self.project(v, sx, sy))
-                    .collect();
-                let face = (rgb.0, rgb.1, rgb.2, 1.0);
-                const BLACK: Rgba = (0.0, 0.0, 0.0, 1.0);
-                push_fan(
-                    &mut gizmo_vertices,
-                    &clip,
-                    face,
-                    BLACK,
-                    self.outline_width,
-                    w,
-                    h,
-                );
+        let mut gizmo_vertices: Vec<Vertex> = Vec::new();
+        for side in gizmo_faces {
+            let blocked = puzzle
+                .twist_pieces(Twist {
+                    side,
+                    layer,
+                    multiplicity: 1,
+                })
+                .is_err();
+            let mut rgb = if blocked {
+                (1.0, 0.0, 0.0)
+            } else {
+                (0.3, 0.5, 1.0)
+            };
+            let hovered = gizmo_hover.is_some_and(|(s, _)| s == side);
+            if !hovered {
+                const DIM: f32 = 0.4;
+                rgb = (rgb.0 * DIM, rgb.1 * DIM, rgb.2 * DIM);
             }
-            let base = color_buf.as_ref().to_vec();
-            depth_buf.clear(1.0);
-            // never cull the gizmos: their backfaces are visible and clickable.
-            rasterize(
-                &sticker_pipeline,
-                &gizmo_vertices,
-                &mut color_buf,
-                &mut depth_buf,
-                false,
+            let clip: Vec<[f32; 4]> = self
+                .gizmo_quad(side)
+                .iter()
+                .map(|&v| self.project(v, sx, sy))
+                .collect();
+            let face = [rgb.0, rgb.1, rgb.2, 1.0];
+            const BLACK: Rgba = [0.0, 0.0, 0.0, 1.0];
+            push_fan(
+                &mut gizmo_vertices,
+                &clip,
+                face,
+                BLACK,
+                self.outline_width,
+                w,
+                h,
             );
-            blend_layers(&base, &mut color_buf, GIZMO_ALPHA);
         }
 
-        let image = egui::ColorImage::new([w, h], color_buf.as_ref().to_vec());
-        let options = egui::TextureOptions::NEAREST;
-        match &mut self.texture {
-            Some(tex) => tex.set(image, options),
-            None => self.texture = Some(ctx.load_texture("puzzle", image, options)),
-        }
-        let texture_id = self.texture.as_ref().unwrap().id();
+        let texture_id = self.gpu.render(&FrameInput {
+            size: [w as u32, h as u32],
+            backface_culling: self.backface_culling,
+            base: &vertices,
+            translucent: &overlay_vertices,
+            flash: &flash_vertices,
+            flash_strength: flash.as_ref().map_or(0.0, |(_, strength)| *strength),
+            gizmos: &gizmo_vertices,
+            gizmo_strength: GIZMO_ALPHA,
+        });
 
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
     }
 }
 
-/// straight-alpha (r, g, b, a), each in [0, 1].
-type Rgba = (f32, f32, f32, f32);
-
-/// A clip-space position, plus the sticker's style (face color, outline color,
-/// outline width in pixels) and per-vertex edge distances (see `push_fan`)
-/// carried to the fragment stage.
-type VsOut = (Rgba, Rgba, f32, (f32, f32, f32));
-type Vertex = ([f32; 4], VsOut);
+/// straight-alpha [r, g, b, a], each in [0, 1].
+type Rgba = [f32; 4];
 
 /// Fan-triangulate a convex clip-space polygon into `out`, attaching edge
 /// attributes for outline drawing: component k, interpolated across the
@@ -778,8 +719,8 @@ fn push_fan(
 ) {
     /// far enough that outline shading never triggers.
     const FAR: f32 = 1e6;
-    // Distances must be measured in the same space euc rasterizes in; the
-    // y-flip of its NDC->pixel map doesn't matter for distances.
+    // Distances must be measured in the space the fragment shader shades in;
+    // the y-flip of the NDC->pixel map doesn't matter for distances.
     let px =
         |c: &[f32; 4]| egui::vec2((c[0] + 1.0) * 0.5 * w as f32, (c[1] + 1.0) * 0.5 * h as f32);
     let n = clip.len();
@@ -804,55 +745,31 @@ fn push_fan(
         } else {
             (FAR, FAR, FAR)
         };
-        out.push((a, (face, outline, outline_width, (ha, e1a, e2a))));
-        out.push((b, (face, outline, outline_width, (0.0, e1b, e2b))));
-        out.push((c, (face, outline, outline_width, (0.0, e1c, e2c))));
-    }
-}
-
-/// Backface culling is a compile-time type param in euc, so branch over the
-/// two monomorphizations. All stickers are wound counterclockwise as seen
-/// from outside their piece, so back faces are the ones hidden inside.
-/// Stylized-transparency composite, as in
-/// https://ajfarkas.dev/blog/hsc2-transparency/: the overlay is rendered
-/// opaquely (so per pixel only its nearest surface shows, with no fog-like
-/// transparent-on-transparent buildup), then blended in place as
-/// `over = (1 - alpha) * base + alpha * over`. The convex combination is also
-/// correct for premultiplied alpha, so overlays work over the transparent
-/// background.
-fn blend_layers(base: &[egui::Color32], over: &mut Buffer2d<egui::Color32>, alpha: f32) {
-    let lerp = |b: u8, o: u8| ((1.0 - alpha) * b as f32 + alpha * o as f32).round() as u8;
-    for (o, b) in over.as_mut().iter_mut().zip(base) {
-        *o = egui::Color32::from_rgba_premultiplied(
-            lerp(b.r(), o.r()),
-            lerp(b.g(), o.g()),
-            lerp(b.b(), o.b()),
-            lerp(b.a(), o.a()),
-        );
-    }
-}
-
-/// composite a premultiplied-alpha overlay buffer over the frame, per pixel:
-/// `out = (1 - a) * base + over`.
-fn blend_overlay(base: &mut Buffer2d<egui::Color32>, over: &Buffer2d<egui::Color32>) {
-    for (b, o) in base.as_mut().iter_mut().zip(over.as_ref()) {
-        if o.a() > 0 {
-            let a = o.a() as f32 / 255.0;
-            let ch = |bv: u8, ov: u8| ((1.0 - a) * bv as f32 + ov as f32).min(255.0).round() as u8;
-            *b = egui::Color32::from_rgba_premultiplied(
-                ch(b.r(), o.r()),
-                ch(b.g(), o.g()),
-                ch(b.b(), o.b()),
-                ch(b.a(), o.a()),
-            );
-        }
+        out.push(Vertex {
+            pos: a,
+            face,
+            outline,
+            width_edges: [outline_width, ha, e1a, e2a],
+        });
+        out.push(Vertex {
+            pos: b,
+            face,
+            outline,
+            width_edges: [outline_width, 0.0, e1b, e2b],
+        });
+        out.push(Vertex {
+            pos: c,
+            face,
+            outline,
+            width_edges: [outline_width, 0.0, e1c, e2c],
+        });
     }
 }
 
 /// depth of clip-space point (u, v) inside the clip-space triangle (a, b, c),
 /// or None if it's outside. `cull_backface` rejects back-facing (negative
-/// signed area) triangles, matching euc's backface culling so hidden faces
-/// aren't pickable when they aren't drawn.
+/// signed area) triangles, matching the GPU's backface culling so hidden
+/// faces aren't pickable when they aren't drawn.
 fn bary_z(
     a: [f32; 4],
     b: [f32; 4],
@@ -870,64 +787,4 @@ fn bary_z(
     let wb = ((c[1] - a[1]) * (u - c[0]) + (a[0] - c[0]) * (v - c[1])) / denom;
     let wc = 1.0 - wa - wb;
     (wa >= 0.0 && wb >= 0.0 && wc >= 0.0).then(|| wa * a[2] + wb * b[2] + wc * c[2])
-}
-
-fn rasterize<P: Pipeline<Vertex = Vertex>>(
-    pipeline: &P,
-    vertices: &[Vertex],
-    color_buf: &mut Buffer2d<P::Pixel>,
-    depth_buf: &mut Buffer2d<f32>,
-    backface_culling: bool,
-) {
-    if backface_culling {
-        pipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingEnabled>, _>(
-            vertices,
-            color_buf,
-            Some(depth_buf),
-        );
-    } else {
-        pipeline.draw::<rasterizer::Triangles<_, rasterizer::BackfaceCullingDisabled>, _>(
-            vertices,
-            color_buf,
-            Some(depth_buf),
-        );
-    }
-}
-
-/// CPU rasterization pipeline for the flat-shaded stickers. Depth testing uses
-/// `euc`'s default `IfLessWrite` strategy against the depth buffer. Emits
-/// premultiplied alpha so `blend_overlay` compositing is a multiply-add.
-struct StickerPipeline;
-impl Pipeline for StickerPipeline {
-    type Vertex = Vertex;
-    type VsOut = VsOut;
-    type Pixel = egui::Color32;
-
-    #[inline(always)]
-    fn vert(&self, (pos, vs_out): &Self::Vertex) -> ([f32; 4], Self::VsOut) {
-        (*pos, *vs_out)
-    }
-
-    #[inline(always)]
-    fn frag(&self, (face, outline, width, (ea, eb, ec)): &Self::VsOut) -> Self::Pixel {
-        // Pixel coverage of the outline: 1 within `width` of the nearest
-        // polygon boundary edge, antialiased over one pixel.
-        let c = if *width > 0.0 {
-            let d = ea.min(*eb).min(*ec);
-            (width + 0.5 - d).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        // The outline (opacity outline.3, scaled by its coverage) composited
-        // over the face (opacity face.3).
-        let a_out = outline.3 * c;
-        let a = a_out + face.3 * (1.0 - a_out);
-        let ch = |f: f32, o: f32| ((o * a_out + f * face.3 * (1.0 - a_out)) * 255.0).round() as u8;
-        egui::Color32::from_rgba_premultiplied(
-            ch(face.0, outline.0),
-            ch(face.1, outline.1),
-            ch(face.2, outline.2),
-            (a * 255.0).round() as u8,
-        )
-    }
 }
