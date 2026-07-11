@@ -17,7 +17,7 @@
 - thing to derive a subpuzzle by deleting pieces
 - refl puzzles
 - drag to rotate should be invariant to window size
-- bug: doing several twists accumulates error and makes it block incorrectly. use approx_collections
+- BUG: doing several twists accumulates error and makes it block incorrectly. use approx_collections
 - blocked red flash should also flash the plane that contains the blocked pieces.
 - gizmos
     - should have default shrink <1
@@ -80,7 +80,9 @@
 
 ## rendering
 
-- rendering: gpu / outlines / lighting
+- FEAT: lighting
+- BUG: outlines are in units of pixels, so resizing the window and scaling the puzzle appears to change their thickness relative to the puzzle.
+- FEAT: gizmo outlines?
 
 ## keybinds / mousebinds / input
 
