@@ -629,7 +629,7 @@ mod tests {
 
     // TODO: float interning with approx_collections
     #[test]
-    fn doctrinaire() {
+    fn doctrinaire_dfs() {
         const DEPTH: usize = 4;
         let twists: [Twist; 9] = Side::ALL
             .map(|side| Twist {
@@ -666,6 +666,35 @@ mod tests {
                 piece.rot.abs_diff_eq(&ROT_ID, 1e-6),
                 "piece not returned to original orientation"
             );
+        }
+    }
+
+    #[test]
+    fn doctrinaire_random() {
+        use rand::prelude::*;
+
+        const N_TWISTS: usize = 1000;
+
+        let twists: [Twist; 9] = Side::ALL
+            .map(|side| Twist {
+                side,
+                layer: 0,
+                multiplicity: 2,
+            })
+            .into_iter()
+            .chain(Side::POS.map(|side| Twist {
+                side,
+                layer: 1,
+                multiplicity: 1,
+            }))
+            .collect_array()
+            .unwrap();
+
+        let mut puzzle = PuzzleState::new();
+
+        for _ in 0..N_TWISTS {
+            let twist = twists.choose(&mut rand::rng()).unwrap();
+            puzzle.twist(*twist).unwrap();
         }
     }
 }
