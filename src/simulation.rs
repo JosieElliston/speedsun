@@ -23,7 +23,7 @@ pub fn ease(t: f32) -> f32 {
 
 /// a state-changing move: a layer twist or a whole-puzzle rotation. separate
 /// variants because rotations grip every piece and can never be blocked.
-/// doubles as the undo-history entry (an Align is recorded as the rotations
+/// doubles as the undo-history entry (an Align is recorded as the rotation
 /// it induced, so the history is nothing but moves).
 #[derive(Debug, Clone, Copy)]
 enum Move {
@@ -31,12 +31,14 @@ enum Move {
     Rotate(PuzzleRotation),
 }
 impl Move {
-    /// rotation axis (unit) and 45°-multiplicity; both kinds share `Twist`'s
-    /// angle convention (multiplicity 1 = -45° about the axis).
-    fn axis_multiplicity(self) -> (Vec3, i8) {
+    /// rotation axis (unit) and angle in radians, for pacing the animation.
+    fn axis_angle(self) -> (Vec3, f32) {
         match self {
-            Move::Twist(twist) => (twist.side.plane(), twist.multiplicity),
-            Move::Rotate(rotation) => (rotation.axis.unit(), rotation.multiplicity),
+            Move::Twist(twist) => (
+                twist.side.plane(),
+                -twist.multiplicity as f32 * std::f32::consts::FRAC_PI_4,
+            ),
+            Move::Rotate(rotation) => rotation.axis_angle(),
         }
     }
 
@@ -164,8 +166,8 @@ impl PuzzleSimulation {
     /// the hub computes `orientation` from the view (which keeps only the
     /// sub-90° residual), and this rotates the state to match — visually
     /// net-zero. After this, face keybinds mean what they look like.
-    /// Recorded in the history as the induced rotation(s), so undoing past
-    /// an align rotates the puzzle back in view like any other rotation.
+    /// Recorded in the history as the induced rotation, so undoing past an
+    /// align rotates the puzzle back in view like any other rotation.
     pub fn align(&mut self, orientation: Rot, now: Instant) {
         // an already-agreeing view is a no-op; don't pollute the history.
         if orientation.s.abs() > 1.0 - 1e-6 {
@@ -175,9 +177,8 @@ impl PuzzleSimulation {
         // them there before re-basing.
         self.finish_queued_moves(now);
         self.rotate_state(orientation);
-        for rotation in PuzzleRotation::decompose(orientation) {
-            self.undo_stack.push(Move::Rotate(rotation));
-        }
+        self.undo_stack
+            .push(Move::Rotate(PuzzleRotation::from_quat(orientation)));
         self.redo_stack.clear();
     }
 
@@ -330,9 +331,8 @@ impl PuzzleSimulation {
     pub fn anim(&self, now: Instant, twist_duration: f32) -> Option<(Vec<bool>, Rot)> {
         self.active_move.as_ref().map(|active| {
             let p = ease(active.progress(now, twist_duration));
-            let (axis, multiplicity) = active.mv.axis_multiplicity();
-            let angle = -multiplicity as f32 * std::f32::consts::FRAC_PI_4 * p;
-            let rot = Rot::from_axis_angle(axis, cgmath::Rad(angle));
+            let (axis, angle) = active.mv.axis_angle();
+            let rot = Rot::from_axis_angle(axis, cgmath::Rad(angle * p));
             let mut mask = vec![false; self.puzzle.pieces.len()];
             for &i in &active.pieces {
                 mask[i] = true;
@@ -424,11 +424,11 @@ mod tests {
     }
 
     #[test]
-    fn two_step_alignment_undoes_in_two_steps() {
+    fn vertex_alignment_undoes_in_one_step() {
         let now = Instant::now();
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
         // a vertex orientation: not a rotation about a single coordinate
-        // axis, so align records two rotations.
+        // axis, but still a single history entry (one 120° rotation).
         let a = PuzzleRotation::new(Axis::X, 2).quat() * PuzzleRotation::new(Axis::Y, 2).quat();
 
         sim.align(a, now);
@@ -436,8 +436,9 @@ mod tests {
 
         sim.handle(Command::Undo, now);
         settle(&mut sim, now);
-        assert!(!same_rot(sim.puzzle().pieces[0].rot, ID));
+        assert!(same_rot(sim.puzzle().pieces[0].rot, ID));
 
+        // that one entry was the whole history.
         sim.handle(Command::Undo, now);
         settle(&mut sim, now);
         assert!(same_rot(sim.puzzle().pieces[0].rot, ID));

@@ -27,72 +27,43 @@ impl Axis {
     }
 }
 
-/// A whole-puzzle rotation (of the puzzle state: every piece rotates).
-/// `multiplicity` is in 45° increments, matching `Twist`'s convention, but it
-/// must always be even: a 45°-rotated puzzle has no coherent face-key
-/// mapping, so keybind/input handling for odd multiples is unsolved. (Kept
-/// in 45° units rather than dividing by 2 so the two multiplicities stay
-/// consistent.)
+/// A whole-puzzle rotation (of the puzzle state: every piece rotates). Holds
+/// an arbitrary rotation: keybinds construct 90° multiples via `new`, and
+/// Align records the (axis-aligned) re-basing it induced via `from_quat`.
 #[derive(Debug, Clone, Copy)]
-pub struct Rotation {
-    pub axis: Axis,
-    pub multiplicity: i8,
-}
+pub struct Rotation(Rot);
 impl Rotation {
+    /// `multiplicity` is in 45° increments, matching `Twist`'s convention
+    /// (multiplicity 1 = -45° about the axis).
     pub fn new(axis: Axis, multiplicity: i8) -> Self {
-        debug_assert!(
-            multiplicity % 2 == 0,
-            "view rotations must be multiples of 90°"
-        );
-        Self { axis, multiplicity }
+        let angle = -multiplicity as f32 * std::f32::consts::FRAC_PI_4;
+        Self::from_quat(Rot::from_axis_angle(axis.unit(), cgmath::Rad(angle)))
+    }
+
+    /// Canonicalized to the s >= 0 hemisphere (q and -q are the same
+    /// rotation) so `axis_angle` animates the short way (<= 180°).
+    pub fn from_quat(rot: Rot) -> Self {
+        Self(if rot.s < 0.0 { -rot } else { rot })
     }
 
     pub fn inv(self) -> Self {
-        Self {
-            axis: self.axis,
-            multiplicity: -self.multiplicity,
-        }
+        // the conjugate of a unit quaternion is its inverse; s is unchanged,
+        // so the result stays canonical.
+        Self(self.0.conjugate())
     }
 
-    /// The rotation applied to the whole puzzle, matching `Twist`'s sign
-    /// convention (multiplicity 1 = -45° about the axis).
+    /// the rotation as applied to the whole puzzle.
     pub fn quat(self) -> Rot {
-        let angle = -self.multiplicity as f32 * std::f32::consts::FRAC_PI_4;
-        Rot::from_axis_angle(self.axis.unit(), cgmath::Rad(angle))
+        self.0
     }
 
-    /// every 90°-multiple rotation about one axis: the building blocks of
-    /// `decompose`.
-    fn all_single() -> impl Iterator<Item = Rotation> {
-        [Axis::X, Axis::Y, Axis::Z]
-            .into_iter()
-            .flat_map(|axis| [-2, 2, 4].map(|multiplicity| Rotation { axis, multiplicity }))
-    }
-
-    /// Decompose one of the 24 axis-aligned orientations into the shortest
-    /// sequence (at most two) of single-axis rotations whose in-order
-    /// application composes to `rot`. Lets an Align record its induced
-    /// rotation in the undo history as ordinary rotations.
-    pub fn decompose(rot: Rot) -> Vec<Rotation> {
-        // quaternions double-cover rotations: q and -q are the same rotation.
-        let eq = |a: Rot, b: Rot| a.dot(b).abs() > 1.0 - 1e-4;
-        if rot.s.abs() > 1.0 - 1e-4 {
-            return vec![];
+    /// rotation axis (unit) and angle in radians, for pacing the animation.
+    pub fn axis_angle(self) -> (Vec3, f32) {
+        let sin_half = self.0.v.magnitude();
+        if sin_half < 1e-9 {
+            return (Vec3::unit_x(), 0.0);
         }
-        for r in Self::all_single() {
-            if eq(r.quat(), rot) {
-                return vec![r];
-            }
-        }
-        for r1 in Self::all_single() {
-            for r2 in Self::all_single() {
-                // applying r1 then r2 composes to q(r2) · q(r1).
-                if eq(r2.quat() * r1.quat(), rot) {
-                    return vec![r1, r2];
-                }
-            }
-        }
-        unreachable!("not one of the 24 axis-aligned orientations: {rot:?}")
+        (self.0.v / sin_half, 2.0 * sin_half.atan2(self.0.s))
     }
 }
 
@@ -116,13 +87,13 @@ pub enum Command {
         origin: Origin,
     },
     /// Make the puzzle state agree with the view: the state is rotated by
-    /// the nearest axis-aligned view orientation, the view keeps only the
-    /// sub-90° residual and snaps it to identity (animated). Visually
-    /// net-zero at the instant it applies — afterward, face keybinds match
-    /// what you see. Recorded in the undo history as the induced rotation(s)
-    /// (`Rotation::decompose`), so undoing past an align rotates the puzzle
-    /// back in view like any other rotation. The only command whose meaning
-    /// depends on the view.
+    /// the axis-aligned part of the home-relative view orientation, and the
+    /// view snaps (animated) to the tuned home orientation (the view tab's
+    /// home pitch/yaw sliders). Visually net-zero at the instant it applies
+    /// — afterward, face keybinds match what you see. Recorded in the undo
+    /// history as the induced rotation, so undoing past an align rotates
+    /// the puzzle back in view like any other rotation. The only command
+    /// whose meaning depends on the view.
     Align,
     Undo,
     Redo,
@@ -133,33 +104,22 @@ pub enum Command {
 
 #[cfg(test)]
 mod tests {
+    use cgmath::AbsDiffEq;
+
     use super::*;
 
     #[test]
-    fn decompose_covers_the_24_orientations() {
-        let q = |axis: Axis| Rotation::new(axis, 2).quat();
-        for i in 0..4 {
-            for j in 0..4 {
-                for k in 0..4 {
-                    let mut rot = Rot::new(1.0, 0.0, 0.0, 0.0);
-                    for _ in 0..i {
-                        rot = q(Axis::X) * rot;
-                    }
-                    for _ in 0..j {
-                        rot = q(Axis::Y) * rot;
-                    }
-                    for _ in 0..k {
-                        rot = q(Axis::Z) * rot;
-                    }
-                    let parts = Rotation::decompose(rot);
-                    assert!(parts.len() <= 2);
-                    let mut recomposed = Rot::new(1.0, 0.0, 0.0, 0.0);
-                    for part in parts {
-                        recomposed = part.quat() * recomposed;
-                    }
-                    assert!(recomposed.dot(rot).abs() > 1.0 - 1e-4, "{rot:?}");
-                }
-            }
-        }
+    fn from_quat_canonicalizes_and_round_trips() {
+        // 270° about X lands in the s < 0 hemisphere; canonicalization flips
+        // it so the extracted animation runs 90° the short way.
+        let q = Rot::from_axis_angle(Vec3::unit_x(), cgmath::Rad(1.5 * std::f32::consts::PI));
+        assert!(q.s < 0.0);
+        let r = Rotation::from_quat(q);
+        assert!(r.quat().s >= 0.0);
+        assert!(r.quat().abs_diff_eq(&-q, 1e-6));
+
+        let (axis, angle) = r.axis_angle();
+        assert!(angle <= std::f32::consts::PI + 1e-6);
+        assert!(Rot::from_axis_angle(axis, cgmath::Rad(angle)).abs_diff_eq(&r.quat(), 1e-6));
     }
 }

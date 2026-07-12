@@ -41,6 +41,11 @@ pub struct PuzzleView {
     rot: Rot,
     /// animated snap of `rot` toward an Align/Rotate target.
     snap: Option<SnapAnim>,
+    /// the home orientation Align snaps the view to (also the startup
+    /// orientation): a tuned slight angle in degrees, so aligned faces
+    /// aren't viewed dead-on.
+    home_pitch: f32,
+    home_yaw: f32,
     /// indices into puzzle.pieces of the pieces selected by shift-clicking.
     selected_pieces: HashSet<usize>,
     show_internal_stickers: bool,
@@ -75,9 +80,13 @@ pub struct PuzzleView {
 }
 impl PuzzleView {
     pub fn new(render_state: egui_wgpu::RenderState) -> Self {
+        let home_pitch = 20.0;
+        let home_yaw = -30.0;
         Self {
-            rot: Rot::from_angle_x(cgmath::Deg(20.0)) * Rot::from_angle_y(cgmath::Deg(-30.0)),
+            rot: home_orientation(home_pitch, home_yaw),
             snap: None,
+            home_pitch,
+            home_yaw,
             selected_pieces: HashSet::new(),
             show_internal_stickers: true,
             backface_culling: true,
@@ -98,6 +107,8 @@ impl PuzzleView {
 
     /// view controls.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::Slider::new(&mut self.home_pitch, -45.0..=45.0).text("home pitch"));
+        ui.add(egui::Slider::new(&mut self.home_yaw, -45.0..=45.0).text("home yaw"));
         ui.checkbox(&mut self.show_internal_stickers, "internal stickers");
         ui.checkbox(&mut self.backface_culling, "backface culling");
         ui.add(egui::Slider::new(&mut self.puzzle_scale, 0.0..=2.0).text("puzzle scale"));
@@ -164,15 +175,16 @@ impl PuzzleView {
         });
     }
 
-    /// The view half of the Align command: strip the axis-aligned part of
-    /// the view orientation (returned, for the simulation to bake into the
-    /// puzzle state), keep only the sub-90° residual, and snap that to
-    /// identity. Visually net-zero at this instant; only the residual
-    /// animates away.
+    /// The view half of the Align command: find the axis-aligned orientation
+    /// A nearest to the home-relative view (view ≈ home·A), strip it
+    /// (returned, for the simulation to bake into the puzzle state), and
+    /// snap what's left to the home orientation. Visually net-zero at this
+    /// instant; only the sub-90° residual animates away.
     pub fn align(&mut self, now: Instant) -> Rot {
-        let a = nearest_alignment(self.rot);
+        let home = home_orientation(self.home_pitch, self.home_yaw);
+        let a = nearest_alignment(home.invert() * self.rot);
         self.rot = self.rot * a.invert();
-        self.snap_to(Rot::new(1.0, 0.0, 0.0, 0.0), now);
+        self.snap_to(home, now);
         a
     }
 
@@ -613,6 +625,12 @@ impl PuzzleView {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
     }
+}
+
+/// the tuned view orientation Align snaps to, from the home pitch/yaw
+/// sliders (degrees). the startup orientation is the sliders' defaults.
+fn home_orientation(pitch: f32, yaw: f32) -> Rot {
+    Rot::from_angle_x(cgmath::Deg(pitch)) * Rot::from_angle_y(cgmath::Deg(yaw))
 }
 
 /// the axis-aligned orientation (one of the cube's 24 rotations) nearest to
