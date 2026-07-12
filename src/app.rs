@@ -43,13 +43,7 @@ impl App {
     /// owns it. components may push follow-up commands (e.g. undoing a
     /// rotation: the simulation records it, the camera applies it).
     fn route_commands(&mut self, now: Instant) {
-        let mut budget = 100;
         while let Some(command) = self.queue.pop_front() {
-            budget -= 1;
-            if budget < 0 {
-                debug_assert!(false, "command ping-pong: {command:?}");
-                break;
-            }
             match command {
                 Command::Twist { .. } | Command::Undo | Command::Redo => {
                     self.queue.extend(self.sim.handle(command, now));
