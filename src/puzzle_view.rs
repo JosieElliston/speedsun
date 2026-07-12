@@ -1,100 +1,45 @@
-use std::{
-    collections::{HashSet, VecDeque},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, time::Instant};
 
 use cgmath::{InnerSpace, Rotation, Rotation3};
-use eframe::{
-    egui::{self, mutex::Mutex},
-    egui_wgpu,
-};
+use eframe::{egui, egui_wgpu};
 
 use crate::{
+    commands::{Command, Origin},
     filters::{FaceColor, Filters},
     puzzle_state::*,
     render::{FrameInput, GpuRenderer, Vertex},
+    simulation::{PuzzleSimulation, ease},
 };
-
-/// below this many frames per twist, animation progress is frame-indexed
-/// instead of clock-based: each drawn frame advances by exactly 1/n_frames, so
-/// the intermediate fractions are deterministic and dt jitter can neither skip
-/// a twist's animation entirely nor change which fraction gets shown.
-const FAST_MODE_MAX_FRAMES: f32 = 3.0;
 
 /// opacity of the hovered twist gizmo face.
 const GIZMO_ALPHA: f32 = 0.35;
 
-fn ease(t: f32) -> f32 {
-    // cosine interpolation
-    0.5 - 0.5 * (t * std::f32::consts::PI).cos()
+/// what the pointer is over this frame, computed by `interact` and consumed
+/// by `draw` (and by the hub as keybind context).
+pub struct Hover {
+    /// the gizmo face under the pointer, and whether its front (outward)
+    /// side faces the camera.
+    pub gizmo: Option<(Side, bool)>,
+    /// the piece under the pointer while shift is held (pick mode).
+    pub piece: Option<usize>,
 }
 
-struct ActiveTwist {
-    twist: Twist,
-    /// indices into puzzle.pieces of the pieces the twist rotates.
-    /// validated by twist_pieces() when the twist started.
-    pieces: Vec<usize>,
-    mode: AnimMode,
-}
-impl ActiveTwist {
-    /// progress through the twist in [0, 1); >= 1 means finished.
-    fn progress(&self, now: Instant, duration: f32) -> f32 {
-        match self.mode {
-            AnimMode::Frame { progress, .. } => progress,
-            AnimMode::Time { start } => {
-                now.saturating_duration_since(start).as_secs_f32() / duration
-            }
-        }
-    }
-}
-
-/// the timing regime, chosen per twist when it starts and then frozen so a
-/// single twist can't flicker between regimes.
-#[derive(Clone, Copy)]
-enum AnimMode {
-    /// slow twists: dt-aware, sampled at real elapsed time. `start` may lie
-    /// before "now" by carried-over time from the previous twist.
-    Time { start: Instant },
-    /// fast twists (~1-2 frames): each drawn frame adds 1/n_frames.
-    Frame { progress: f32, n_frames: f32 },
-}
-
-/// tints the pieces that blocked a twist red, fading out.
-struct BlockedFlash {
-    /// indices into puzzle.pieces of the blocking pieces.
-    pieces: Vec<usize>,
+/// an in-flight view snap (from an Align or Rotate command), slerped over
+/// the twist duration.
+struct SnapAnim {
+    from: Rot,
+    to: Rot,
     start: Instant,
 }
-impl BlockedFlash {
-    /// red tint strength in [0, 1]; 0 means expired.
-    fn strength(&self, now: Instant, duration: f32) -> f32 {
-        let t = now.saturating_duration_since(self.start).as_secs_f32() / duration;
-        (1.0 - t).max(0.0)
-    }
-}
 
-/// how a twist's progress begins: fresh from the queue, or carrying the
-/// previous twist's overshoot so back-to-back twists keep a steady cadence.
-enum AnimStart {
-    Fresh,
-    /// leftover fraction of a twist (can exceed 1 at very fast speeds).
-    CarryFrames(f32),
-    /// the instant the previous twist nominally finished.
-    CarryTime(Instant),
-}
-
+/// The view: camera orientation, view settings, per-view selection, and the
+/// renderer. Reads the simulation; never writes it (twists and selection
+/// changes are emitted as commands for the hub to route).
 pub struct PuzzleView {
-    puzzle: Arc<Mutex<PuzzleState>>,
     /// view rotation (dragged with the mouse). in view space, not puzzle space.
     rot: Rot,
-    active_twist: Option<ActiveTwist>,
-    twist_queue: VecDeque<Twist>,
-    blocked_flash: Option<BlockedFlash>,
-    /// seconds the pieces blocking a rejected twist stay tinted red.
-    blocked_flash_duration: f32,
-    /// seconds per twist animation.
-    twist_duration: f32,
+    /// animated snap of `rot` toward an Align/Rotate target.
+    snap: Option<SnapAnim>,
     /// indices into puzzle.pieces of the pieces selected by shift-clicking.
     selected_pieces: HashSet<usize>,
     show_internal_stickers: bool,
@@ -120,19 +65,18 @@ pub struct PuzzleView {
     /// when clicking the back of a gizmo face, input the twist as seen from
     /// the camera (mirrored) instead of as defined from outside the face.
     reverse_backface_twists: bool,
+    /// seconds per twist animation (also paces view snaps).
+    pub twist_duration: f32,
+    /// seconds the pieces blocking a rejected twist stay tinted red.
+    pub blocked_flash_duration: f32,
     /// the wgpu pipelines and render targets the frame is drawn with.
     gpu: GpuRenderer,
 }
 impl PuzzleView {
-    pub fn new(puzzle: Arc<Mutex<PuzzleState>>, render_state: egui_wgpu::RenderState) -> Self {
+    pub fn new(render_state: egui_wgpu::RenderState) -> Self {
         Self {
-            puzzle,
             rot: Rot::from_angle_x(cgmath::Deg(20.0)) * Rot::from_angle_y(cgmath::Deg(-30.0)),
-            active_twist: None,
-            twist_queue: VecDeque::new(),
-            blocked_flash: None,
-            blocked_flash_duration: 0.4,
-            twist_duration: 0.15,
+            snap: None,
             selected_pieces: HashSet::new(),
             show_internal_stickers: true,
             backface_culling: true,
@@ -145,12 +89,11 @@ impl PuzzleView {
             show_gizmos: false,
             gizmo_shrink: 1.0,
             reverse_backface_twists: true,
+            twist_duration: 0.15,
+            blocked_flash_duration: 0.4,
             gpu: GpuRenderer::new(render_state),
         }
     }
-
-    // fn sticker_of_pos(&self, pos: egui::Pos2) -> Option<PieceId> {}
-    // fn piece_of_pos(&self, pos: egui::Pos2) -> Option<PieceId> {}
 
     /// view controls.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
@@ -178,6 +121,12 @@ impl PuzzleView {
     }
 
     pub fn drag(&mut self, dv: egui::Vec2, sensitivity: f32) {
+        if dv == egui::Vec2::ZERO {
+            return;
+        }
+        // dragging cancels a snap; `rot` already holds the last drawn
+        // interpolation, so the view continues from where it looks.
+        self.snap = None;
         let dx = cgmath::Deg(dv.x * sensitivity);
         let dy = cgmath::Deg(dv.y * sensitivity);
         let rot_x = Rot::from_angle_x(dy);
@@ -185,98 +134,70 @@ impl PuzzleView {
         self.rot = rot_y * rot_x * self.rot;
     }
 
-    /// queue a twist; it animates and is applied to the puzzle when the
-    /// animation finishes. blocked twists are dropped when they would start.
-    pub fn push_twist(&mut self, twist: Twist) {
-        self.twist_queue.push_back(twist);
-    }
-
-    /// per-frame animation tick: advance the active twist by one drawn frame,
-    /// apply it to the puzzle once finished, and chain into the queue.
-    fn advance_twist(&mut self, puzzle: &mut PuzzleState, now: Instant, stable_dt: f32) {
-        match &mut self.active_twist {
-            None => self.start_next_twist(puzzle, AnimStart::Fresh, now, stable_dt),
-            Some(active) => {
-                // Time mode derives progress from the clock instead.
-                if let AnimMode::Frame { progress, n_frames } = &mut active.mode {
-                    *progress += 1.0 / *n_frames;
-                }
-            }
-        }
-
-        // Apply finished twists. Loops because at very fast speeds
-        // (n_frames < 1) several twists can complete in one drawn frame.
-        loop {
-            let Some(active) = &self.active_twist else {
-                return;
-            };
-            let p = active.progress(now, self.twist_duration);
-            if p < 1.0 {
-                return;
-            }
-            let twist = active.twist;
-            let carry = match active.mode {
-                AnimMode::Frame { progress, .. } => AnimStart::CarryFrames(progress - 1.0),
-                AnimMode::Time { start } => {
-                    AnimStart::CarryTime(start + Duration::from_secs_f32(self.twist_duration))
-                }
-            };
-            puzzle
-                .twist(twist)
-                .expect("twist was validated when its animation started");
-            self.active_twist = None;
-            self.start_next_twist(puzzle, carry, now, stable_dt);
-        }
-    }
-
-    fn start_next_twist(
-        &mut self,
-        puzzle: &PuzzleState,
-        start: AnimStart,
-        now: Instant,
-        stable_dt: f32,
-    ) {
-        while let Some(twist) = self.twist_queue.pop_front() {
-            let pieces = match puzzle.twist_pieces(twist) {
-                Ok(pieces) => pieces,
-                // blocked: drop the twist and flash the blocking pieces.
-                Err(e) => {
-                    self.blocked_flash = Some(BlockedFlash {
-                        pieces: e.blocked,
-                        start: now,
-                    });
-                    continue;
-                }
-            };
-            let n_frames = self.twist_duration / stable_dt.clamp(1e-4, 1.0);
-            let mode = if n_frames < FAST_MODE_MAX_FRAMES {
-                let progress = match start {
-                    // this drawn frame is the twist's first frame.
-                    AnimStart::Fresh | AnimStart::CarryTime(_) => 1.0 / n_frames,
-                    // the previous twist's overshoot already includes this
-                    // frame's share.
-                    AnimStart::CarryFrames(carry) => carry,
-                };
-                AnimMode::Frame { progress, n_frames }
+    /// advance the snap animation; `rot` is the drawn orientation afterward.
+    fn tick_camera(&mut self, now: Instant) {
+        if let Some(snap) = &self.snap {
+            let t = now.saturating_duration_since(snap.start).as_secs_f32()
+                / self.twist_duration.max(1e-4);
+            if t >= 1.0 {
+                self.rot = snap.to;
+                self.snap = None;
             } else {
-                let start = match start {
-                    // backdate by one frame so the first drawn frame already
-                    // shows motion (matching Frame mode's 1/n_frames start);
-                    // starting at rest reads as input lag.
-                    AnimStart::Fresh | AnimStart::CarryFrames(_) => {
-                        now - Duration::from_secs_f32(stable_dt)
-                    }
-                    AnimStart::CarryTime(t) => t,
-                };
-                AnimMode::Time { start }
-            };
-            self.active_twist = Some(ActiveTwist {
-                twist,
-                pieces,
-                mode,
-            });
-            return;
+                self.rot = snap.from.slerp(snap.to, ease(t));
+            }
         }
+    }
+
+    /// where the view is heading: the snap target if snapping, else the
+    /// current orientation.
+    fn target_rot(&self) -> Rot {
+        self.snap.as_ref().map_or(self.rot, |snap| snap.to)
+    }
+
+    /// the axis-aligned orientation nearest to where the view is heading.
+    /// keybinds resolve view-space faces to puzzle-space sides through this,
+    /// which is what makes twisting-what-you-see work without forcing an
+    /// align on every keypress.
+    pub fn alignment(&self) -> Rot {
+        nearest_alignment(self.target_rot())
+    }
+
+    fn snap_to(&mut self, to: Rot, now: Instant) {
+        let from = self.rot;
+        let mut to = to.normalize();
+        // quaternion double cover: pick the representative on `from`'s
+        // hemisphere so slerp takes the short way.
+        if from.dot(to) < 0.0 {
+            to = -to;
+        }
+        self.snap = Some(SnapAnim {
+            from,
+            to,
+            start: now,
+        });
+    }
+
+    /// apply a whole-puzzle rotation command (about a puzzle-space axis),
+    /// animated. composes onto the current snap target so rapid inputs chain.
+    pub fn apply_rotation(&mut self, rotation: crate::commands::Rotation, now: Instant) {
+        let to = self.target_rot() * rotation.quat();
+        self.snap_to(to, now);
+    }
+
+    /// snap the view to the nearest axis-aligned orientation, animated.
+    pub fn align(&mut self, now: Instant) {
+        let to = nearest_alignment(self.target_rot());
+        self.snap_to(to, now);
+    }
+
+    pub fn toggle_selection(&mut self, piece_idx: usize) {
+        if !self.selected_pieces.remove(&piece_idx) {
+            self.selected_pieces.insert(piece_idx);
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selected_pieces.clear();
     }
 
     /// one face of the uncut cube, used as a twist-input gizmo. The exploded
@@ -365,36 +286,35 @@ impl PuzzleView {
         ]
     }
 
-    pub fn draw(
-        &mut self,
-        painter: &egui::Painter,
-        response: &egui::Response,
-        layer: u8,
-        filters: &Filters,
-        now: Instant,
-    ) {
-        // Clone the Arc so the lock guard doesn't borrow self (advance_twist
-        // needs &mut self while the puzzle is locked).
-        let puzzle = Arc::clone(&self.puzzle);
-        let mut puzzle = puzzle.lock();
-
-        let rect = painter.clip_rect();
-        let ctx = painter.ctx();
-
-        // Render into a buffer sized in physical pixels so the result is crisp
-        // regardless of the display's scale factor.
-        let ppp = ctx.pixels_per_point();
-        // at least 1: euc divides by the buffer size, and egui can hand out a
-        // transiently empty rect mid-resize.
+    /// physical-pixel buffer size and world-to-NDC scales for a viewport
+    /// rect. `sx`/`sy` keep the puzzle square in a non-square viewport.
+    fn viewport(&self, rect: egui::Rect, ppp: f32) -> (usize, usize, f32, f32) {
+        // at least 1: egui can hand out a transiently empty rect mid-resize.
         let w = ((rect.width() * ppp).round() as usize).max(1);
         let h = ((rect.height() * ppp).round() as usize).max(1);
-
-        // The puzzle is rendered orthographically. `sx`/`sy` scale world units to
-        // NDC, keeping the puzzle square in a non-square viewport (matching the
-        // old `size().min_elem()` behavior).
         let min = w.min(h) as f32;
         let sx = min * self.puzzle_scale / (2.0 * w as f32);
         let sy = min * self.puzzle_scale / (2.0 * h as f32);
+        (w, h, sx, sy)
+    }
+
+    /// Interpret pointer input: gizmo hover/clicks (twist input) and
+    /// shift-hover/clicks (piece picking and selection). Emits commands
+    /// instead of mutating; the returned `Hover` feeds `draw` and the
+    /// keybinds' input context. Also advances the camera snap animation.
+    pub fn interact(
+        &mut self,
+        sim: &PuzzleSimulation,
+        response: &egui::Response,
+        layer: u8,
+        now: Instant,
+    ) -> (Vec<Command>, Hover) {
+        self.tick_camera(now);
+        let mut commands = Vec::new();
+
+        let ctx = &response.ctx;
+        let rect = response.rect;
+        let (_, _, sx, sy) = self.viewport(rect, ctx.pixels_per_point());
 
         // pointer position in clip space, if it's over the viewport.
         let pointer_clip: Option<(f32, f32)> = if rect.width() > 0.0 && rect.height() > 0.0 {
@@ -424,7 +344,8 @@ impl PuzzleView {
                 self.gizmo_hit(xv, yv)
             })
         };
-        // Handle presses before advance_twist so the twist starts this frame.
+        // The hub routes these to the simulation before its tick, so the
+        // twist still starts on the frame of the press.
         if let Some((side, front)) = gizmo_hover {
             // twist on mouse down (not click) for a snappier feel; dragging the
             // background still rotates the view. left: CCW (like the `'`
@@ -446,65 +367,26 @@ impl PuzzleView {
                 if !front && self.reverse_backface_twists {
                     multiplicity = -multiplicity;
                 }
-                self.push_twist(Twist {
-                    side,
-                    layer,
-                    multiplicity,
+                commands.push(Command::Twist {
+                    twist: Twist {
+                        side,
+                        layer,
+                        multiplicity,
+                    },
+                    origin: Origin::User,
                 });
             }
         }
 
-        let stable_dt = ctx.input(|i| i.stable_dt);
-        self.advance_twist(&mut puzzle, now, stable_dt);
-
-        if let Some(flash) = &self.blocked_flash
-            && flash.strength(now, self.blocked_flash_duration) <= 0.0
-        {
-            self.blocked_flash = None;
-        }
-        // Red tint mask for the pieces that blocked a rejected twist.
-        let flash: Option<(Vec<bool>, f32)> = self.blocked_flash.as_ref().map(|flash| {
-            let mut mask = vec![false; puzzle.pieces.len()];
-            for &i in &flash.pieces {
-                mask[i] = true;
-            }
-            (mask, flash.strength(now, self.blocked_flash_duration))
-        });
-
-        // Partial rotation of the animating layer's pieces. The angle formula
-        // must match PuzzleState::twist exactly so progress 1 converges to the
-        // applied state.
-        let anim: Option<(Vec<bool>, Rot)> = self.active_twist.as_ref().map(|active| {
-            let p = ease(active.progress(now, self.twist_duration));
-            let angle = -active.twist.multiplicity as f32 * std::f32::consts::FRAC_PI_4 * p;
-            let rot = Rot::from_axis_angle(active.twist.side.plane(), cgmath::Rad(angle));
-            let mut mask = vec![false; puzzle.pieces.len()];
-            for &i in &active.pieces {
-                mask[i] = true;
-            }
-            (mask, rot)
-        });
-
-        // Correct visibility needs a per-pixel depth buffer, not a per-sticker
-        // depth sort: sorting can't resolve interpenetrating or cyclically
-        // overlapping polygons. Every sticker triangle is rendered with wgpu
-        // (depth-tested) into a texture that's then drawn as an egui image.
-        let mut vertices: Vec<Vertex> = Vec::new();
-        // stickers whose filter style makes them translucent; rendered as a
-        // stylized-transparency overlay instead of into the base pass.
-        let mut overlay_vertices: Vec<Vertex> = Vec::new();
-        // pure-red copies of the blocked pieces' triangles, overlaid on top of
-        // the normally-drawn scene with stylized transparency.
-        let mut flash_vertices: Vec<Vertex> = Vec::new();
-
         // with shift held, pick the piece under the pointer (nearest clip-space
-        // depth among the sticker triangles containing it) in a pre-pass, so
-        // its hovered style can be applied in the normal draw order below.
-        // filtered-out pieces stay pickable; picking ignores their visibility.
+        // depth among the sticker triangles containing it), so its hovered
+        // style can be applied when drawing. filtered-out pieces stay
+        // pickable; picking ignores their visibility.
+        let anim = sim.anim(now, self.twist_duration);
         let pick_pos = if shift { pointer_clip } else { None };
         let hovered_piece: Option<usize> = pick_pos.and_then(|(u, v)| {
             let mut pick_best: Option<(usize, f32)> = None;
-            for (piece_idx, piece) in puzzle.pieces.iter().enumerate() {
+            for (piece_idx, piece) in sim.puzzle().pieces.iter().enumerate() {
                 let piece_rot = match &anim {
                     Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
                     _ => piece.rot,
@@ -537,27 +419,67 @@ impl PuzzleView {
         });
 
         // shift-click toggles the hovered piece's membership in the selection;
-        // shift-clicking the background clears the selection. handled before
-        // rendering so the change is reflected in this frame's styles.
+        // shift-clicking the background clears the selection. the hub routes
+        // these back to this view before draw, so the change is reflected in
+        // this frame's styles.
         if shift && response.clicked() {
-            match hovered_piece {
-                Some(piece_idx) => {
-                    if !self.selected_pieces.remove(&piece_idx) {
-                        self.selected_pieces.insert(piece_idx);
-                    }
-                }
-                None => self.selected_pieces.clear(),
-            }
+            commands.push(match hovered_piece {
+                Some(piece_idx) => Command::TogglePieceSelection(piece_idx),
+                None => Command::ClearSelection,
+            });
         }
 
-        for (piece_idx, piece) in puzzle.pieces.iter().enumerate() {
+        (
+            commands,
+            Hover {
+                gizmo: gizmo_hover,
+                piece: hovered_piece,
+            },
+        )
+    }
+
+    /// Render the puzzle: read-only against the simulation and filters.
+    pub fn draw(
+        &mut self,
+        sim: &PuzzleSimulation,
+        filters: &Filters,
+        hover: &Hover,
+        layer: u8,
+        painter: &egui::Painter,
+        now: Instant,
+    ) {
+        let rect = painter.clip_rect();
+        let ctx = painter.ctx();
+
+        // Render into a buffer sized in physical pixels so the result is crisp
+        // regardless of the display's scale factor.
+        let (w, h, sx, sy) = self.viewport(rect, ctx.pixels_per_point());
+
+        // Red tint mask for the pieces that blocked a rejected twist.
+        let flash = sim.flash(now, self.blocked_flash_duration);
+        // Partial rotation of the animating layer's pieces.
+        let anim = sim.anim(now, self.twist_duration);
+
+        // Correct visibility needs a per-pixel depth buffer, not a per-sticker
+        // depth sort: sorting can't resolve interpenetrating or cyclically
+        // overlapping polygons. Every sticker triangle is rendered with wgpu
+        // (depth-tested) into a texture that's then drawn as an egui image.
+        let mut vertices: Vec<Vertex> = Vec::new();
+        // stickers whose filter style makes them translucent; rendered as a
+        // stylized-transparency overlay instead of into the base pass.
+        let mut overlay_vertices: Vec<Vertex> = Vec::new();
+        // pure-red copies of the blocked pieces' triangles, overlaid on top of
+        // the normally-drawn scene with stylized transparency.
+        let mut flash_vertices: Vec<Vertex> = Vec::new();
+
+        for (piece_idx, piece) in sim.puzzle().pieces.iter().enumerate() {
             let piece_rot = match &anim {
                 Some((mask, anim_rot)) if mask[piece_idx] => anim_rot * piece.rot,
                 _ => piece.rot,
             };
             let flashed = matches!(&flash, Some((mask, _)) if mask[piece_idx]);
 
-            let hovered = hovered_piece == Some(piece_idx);
+            let hovered = hover.piece == Some(piece_idx);
             let selected = self.selected_pieces.contains(&piece_idx);
             let style = filters.style_of_state(piece, hovered, selected);
             let face_a = style.face_opacity.clamp(0.0, 1.0);
@@ -645,11 +567,12 @@ impl PuzzleView {
         let gizmo_faces: Vec<Side> = if self.show_gizmos {
             Side::ALL.to_vec()
         } else {
-            gizmo_hover.iter().map(|&(side, _)| side).collect()
+            hover.gizmo.iter().map(|&(side, _)| side).collect()
         };
         let mut gizmo_vertices: Vec<Vertex> = Vec::new();
         for side in gizmo_faces {
-            let blocked = puzzle
+            let blocked = sim
+                .puzzle()
                 .twist_pieces(Twist {
                     side,
                     layer,
@@ -661,7 +584,7 @@ impl PuzzleView {
             } else {
                 (0.3, 0.5, 1.0)
             };
-            let hovered = gizmo_hover.is_some_and(|(s, _)| s == side);
+            let hovered = hover.gizmo.is_some_and(|(s, _)| s == side);
             if !hovered {
                 const DIM: f32 = 0.4;
                 rgb = (rgb.0 * DIM, rgb.1 * DIM, rgb.2 * DIM);
@@ -698,6 +621,28 @@ impl PuzzleView {
         let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         painter.image(texture_id, rect, uv, egui::Color32::WHITE);
     }
+}
+
+/// the axis-aligned orientation (one of the cube's 24 rotations) nearest to
+/// `rot`, on `rot`'s hemisphere of the quaternion double cover.
+fn nearest_alignment(rot: Rot) -> Rot {
+    let mut best: Option<(Rot, f32)> = None;
+    // Rx^i * Ry^j * Rz^k over 90° steps covers all 24 orientations.
+    for i in 0..4 {
+        for j in 0..4 {
+            for k in 0..4 {
+                let q = Rot::from_angle_x(cgmath::Deg(90.0 * i as f32))
+                    * Rot::from_angle_y(cgmath::Deg(90.0 * j as f32))
+                    * Rot::from_angle_z(cgmath::Deg(90.0 * k as f32));
+                let d = rot.dot(q);
+                let (q, d) = if d < 0.0 { (-q, -d) } else { (q, d) };
+                if best.is_none_or(|(_, best_d)| d > best_d) {
+                    best = Some((q, d));
+                }
+            }
+        }
+    }
+    best.expect("the loop always runs").0
 }
 
 /// straight-alpha [r, g, b, a], each in [0, 1].
@@ -787,4 +732,48 @@ fn bary_z(
     let wb = ((c[1] - a[1]) * (u - c[0]) + (a[0] - c[0]) * (v - c[1])) / denom;
     let wc = 1.0 - wa - wb;
     (wa >= 0.0 && wb >= 0.0 && wc >= 0.0).then(|| wa * a[2] + wb * b[2] + wc * c[2])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// every 90°-step Euler product, i.e. the candidates nearest_alignment
+    /// searches.
+    fn euler_grid() -> impl Iterator<Item = Rot> {
+        (0..4).flat_map(|i| {
+            (0..4).flat_map(move |j| {
+                (0..4).map(move |k| {
+                    Rot::from_angle_x(cgmath::Deg(90.0 * i as f32))
+                        * Rot::from_angle_y(cgmath::Deg(90.0 * j as f32))
+                        * Rot::from_angle_z(cgmath::Deg(90.0 * k as f32))
+                })
+            })
+        })
+    }
+
+    #[test]
+    fn euler_grid_covers_the_24_cube_orientations() {
+        let mut distinct: Vec<Rot> = Vec::new();
+        for q in euler_grid() {
+            if !distinct.iter().any(|p| p.dot(q).abs() > 1.0 - 1e-4) {
+                distinct.push(q);
+            }
+        }
+        assert_eq!(distinct.len(), 24);
+    }
+
+    #[test]
+    fn nearest_alignment_snaps_small_wiggles_back() {
+        // a small view-space wiggle on top of any axis-aligned orientation
+        // must snap back to that orientation.
+        let wiggle = Rot::from_angle_x(cgmath::Deg(9.0)) * Rot::from_angle_y(cgmath::Deg(-7.0));
+        for q in euler_grid() {
+            let snapped = nearest_alignment(wiggle * q);
+            assert!(
+                snapped.dot(q).abs() > 1.0 - 1e-4,
+                "wiggled {q:?} snapped to {snapped:?}"
+            );
+        }
+    }
 }

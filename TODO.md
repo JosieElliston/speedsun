@@ -47,18 +47,34 @@
 - twist
     - maybe keybinds send a anim twist command
     - and once the animation finishes, AnimState sends a puzzle state twist command
-- rotation
+- rotate
+- realign
+- scramble
+- reset
+- filters
     - next/prev
     - set exactly
     - how to handle sequences?
     - maybe clicking on the sequence will show everything with the sequence fallback, and is its own special stage
+- macro
 
 ### components list
 
 - puzzle view
+    - factor out animations vs geometry?
 - puzzle state
 - TODO: what is puzzle controller (look at HSC1/2)
 - input state
+- filters
+- timer
+- puzzle builder
+- scrambler?
+- macros
+- move input?
+- colors?
+- stickering?
+- replay file viewer?
+- fmc timeline?
 
 ## filters
 

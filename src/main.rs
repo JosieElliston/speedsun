@@ -1,8 +1,11 @@
 mod app;
+mod commands;
 mod filters;
+mod keybinds;
 mod puzzle_state;
 mod puzzle_view;
 mod render;
+mod simulation;
 
 fn main() -> Result<(), eframe::Error> {
     // let puzzle = puzzle::MixupCube::new();
