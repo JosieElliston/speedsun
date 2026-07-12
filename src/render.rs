@@ -210,7 +210,11 @@ impl GpuRenderer {
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING;
         let scene = texture_view("scene", COLOR_FORMAT, attach_and_bind);
         let overlay = texture_view("overlay", COLOR_FORMAT, attach_and_bind);
-        let depth = texture_view("depth", DEPTH_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let depth = texture_view(
+            "depth",
+            DEPTH_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT,
+        );
 
         let layout = self.composite.get_bind_group_layout(0);
         let bind_groups = [TRANSLUCENT, FLASH, GIZMO].map(|slot| {
@@ -261,10 +265,7 @@ impl GpuRenderer {
         let device = &self.render_state.device;
         let queue = &self.render_state.queue;
 
-        for (slot, strength) in [
-            (FLASH, input.flash_strength),
-            (GIZMO, input.gizmo_strength),
-        ] {
+        for (slot, strength) in [(FLASH, input.flash_strength), (GIZMO, input.gizmo_strength)] {
             queue.write_buffer(
                 &self.strengths[slot],
                 0,
@@ -330,17 +331,38 @@ impl GpuRenderer {
         // putting them on top of everything.
         if let Some(buf) = &translucent_buf {
             let n = input.translucent.len() as u32;
-            self.overlay_layer(&mut encoder, culled, buf, n, wgpu::LoadOp::Load, TRANSLUCENT);
+            self.overlay_layer(
+                &mut encoder,
+                culled,
+                buf,
+                n,
+                wgpu::LoadOp::Load,
+                TRANSLUCENT,
+            );
         }
         if let Some(buf) = &flash_buf {
             let n = input.flash.len() as u32;
-            self.overlay_layer(&mut encoder, culled, buf, n, wgpu::LoadOp::Clear(1.0), FLASH);
+            self.overlay_layer(
+                &mut encoder,
+                culled,
+                buf,
+                n,
+                wgpu::LoadOp::Clear(1.0),
+                FLASH,
+            );
         }
         if let Some(buf) = &gizmo_buf {
             // never cull the gizmos: their backfaces are visible and clickable.
             let n = input.gizmos.len() as u32;
             let pipeline = &self.sticker_nocull;
-            self.overlay_layer(&mut encoder, pipeline, buf, n, wgpu::LoadOp::Clear(1.0), GIZMO);
+            self.overlay_layer(
+                &mut encoder,
+                pipeline,
+                buf,
+                n,
+                wgpu::LoadOp::Clear(1.0),
+                GIZMO,
+            );
         }
 
         queue.submit([encoder.finish()]);

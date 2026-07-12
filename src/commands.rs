@@ -27,11 +27,12 @@ impl Axis {
     }
 }
 
-/// A whole-puzzle *view* rotation. `multiplicity` is in 45° increments,
-/// matching `Twist`'s convention, but it must always be even: a 45°-rotated
-/// view has no coherent face-key mapping, so keybind/input handling for odd
-/// multiples is unsolved. (Kept in 45° units rather than dividing by 2 so the
-/// two multiplicities stay consistent.)
+/// A whole-puzzle rotation (of the puzzle state: every piece rotates).
+/// `multiplicity` is in 45° increments, matching `Twist`'s convention, but it
+/// must always be even: a 45°-rotated puzzle has no coherent face-key
+/// mapping, so keybind/input handling for odd multiples is unsolved. (Kept
+/// in 45° units rather than dividing by 2 so the two multiplicities stay
+/// consistent.)
 #[derive(Debug, Clone, Copy)]
 pub struct Rotation {
     pub axis: Axis,
@@ -67,18 +68,30 @@ impl Rotation {
 /// component directly instead.)
 #[derive(Debug, Clone, Copy)]
 pub enum Command {
-    /// A twist, always in puzzle space: producers (keybinds, gizmo clicks)
-    /// resolve view-relative input before emitting, so a future command log
-    /// needs no mouse or view data.
-    Twist { twist: Twist, origin: Origin },
-    /// Rotate the whole puzzle (a view rotation, but logically part of the
-    /// solve: it changes what later view-relative input means, and is
-    /// undoable).
-    Rotate { rotation: Rotation, origin: Origin },
-    /// Snap the view to the nearest of the 24 axis-aligned orientations
-    /// (animated). Cosmetic: not undoable, doesn't change the face-key
-    /// mapping (which always goes through the nearest alignment).
+    /// A twist, always in puzzle space. Keybinds are absolute (F is always
+    /// `Side::F`); looking around with the mouse never changes what a key
+    /// means. Only `Align` re-bases the state onto the view.
+    Twist {
+        twist: Twist,
+        origin: Origin,
+    },
+    /// Rotate the whole puzzle state (every piece), animated through the
+    /// twist queue like a twist of all layers; undoable.
+    Rotate {
+        rotation: Rotation,
+        origin: Origin,
+    },
+    /// Make the puzzle state agree with the view: the state is rotated by
+    /// the nearest axis-aligned view orientation (recorded in the undo
+    /// history), the view keeps only the sub-90° residual and snaps it to
+    /// identity (animated). Visually net-zero at the instant it applies —
+    /// afterward, face keybinds match what you see. The only command whose
+    /// meaning depends on the view.
     Align,
+    /// Compose a rotation onto the view without touching the puzzle state:
+    /// the cosmetic compensation emitted when undoing/redoing an `Align`,
+    /// keeping the re-basing visually net-zero.
+    RotateView(Rot),
     Undo,
     Redo,
     /// Toggle a piece's membership in the view's selection.

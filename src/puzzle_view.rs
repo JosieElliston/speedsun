@@ -24,8 +24,8 @@ pub struct Hover {
     pub piece: Option<usize>,
 }
 
-/// an in-flight view snap (from an Align or Rotate command), slerped over
-/// the twist duration.
+/// an in-flight view snap (an Align command's residual heading to identity),
+/// slerped over the twist duration.
 struct SnapAnim {
     from: Rot,
     to: Rot,
@@ -148,20 +148,6 @@ impl PuzzleView {
         }
     }
 
-    /// where the view is heading: the snap target if snapping, else the
-    /// current orientation.
-    fn target_rot(&self) -> Rot {
-        self.snap.as_ref().map_or(self.rot, |snap| snap.to)
-    }
-
-    /// the axis-aligned orientation nearest to where the view is heading.
-    /// keybinds resolve view-space faces to puzzle-space sides through this,
-    /// which is what makes twisting-what-you-see work without forcing an
-    /// align on every keypress.
-    pub fn alignment(&self) -> Rot {
-        nearest_alignment(self.target_rot())
-    }
-
     fn snap_to(&mut self, to: Rot, now: Instant) {
         let from = self.rot;
         let mut to = to.normalize();
@@ -177,17 +163,27 @@ impl PuzzleView {
         });
     }
 
-    /// apply a whole-puzzle rotation command (about a puzzle-space axis),
-    /// animated. composes onto the current snap target so rapid inputs chain.
-    pub fn apply_rotation(&mut self, rotation: crate::commands::Rotation, now: Instant) {
-        let to = self.target_rot() * rotation.quat();
-        self.snap_to(to, now);
+    /// The view half of the Align command: strip the axis-aligned part of
+    /// the view orientation (returned, for the simulation to bake into the
+    /// puzzle state), keep only the sub-90° residual, and snap that to
+    /// identity. Visually net-zero at this instant; only the residual
+    /// animates away.
+    pub fn align(&mut self, now: Instant) -> Rot {
+        let a = nearest_alignment(self.rot);
+        self.rot = self.rot * a.invert();
+        self.snap_to(Rot::new(1.0, 0.0, 0.0, 0.0), now);
+        a
     }
 
-    /// snap the view to the nearest axis-aligned orientation, animated.
-    pub fn align(&mut self, now: Instant) {
-        let to = nearest_alignment(self.target_rot());
-        self.snap_to(to, now);
+    /// compose `rot` (puzzle-space) onto the view without touching the
+    /// puzzle state: the cosmetic compensation that keeps undoing/redoing an
+    /// Align visually net-zero.
+    pub fn rotate_view(&mut self, rot: Rot) {
+        self.rot = self.rot * rot;
+        if let Some(snap) = &mut self.snap {
+            snap.from = snap.from * rot;
+            snap.to = snap.to * rot;
+        }
     }
 
     pub fn toggle_selection(&mut self, piece_idx: usize) {

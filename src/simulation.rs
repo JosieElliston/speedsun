@@ -3,10 +3,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cgmath::Rotation3;
+use cgmath::{Rotation, Rotation3};
 
 use crate::{
-    commands::{Command, Origin, Rotation},
+    commands::{Command, Origin, Rotation as PuzzleRotation},
     puzzle_state::*,
 };
 
@@ -21,15 +21,33 @@ pub fn ease(t: f32) -> f32 {
     0.5 - 0.5 * (t * std::f32::consts::PI).cos()
 }
 
-struct ActiveTwist {
-    twist: Twist,
-    /// indices into puzzle.pieces of the pieces the twist rotates.
-    /// validated by twist_pieces() when the twist started.
+/// a state-changing move: a layer twist or a whole-puzzle rotation. separate
+/// types because rotations grip every piece and can never be blocked.
+#[derive(Debug, Clone, Copy)]
+enum Move {
+    Twist(Twist),
+    Rotate(PuzzleRotation),
+}
+impl Move {
+    /// rotation axis (unit) and 45°-multiplicity; both kinds share `Twist`'s
+    /// angle convention (multiplicity 1 = -45° about the axis).
+    fn axis_multiplicity(self) -> (Vec3, i8) {
+        match self {
+            Move::Twist(twist) => (twist.side.plane(), twist.multiplicity),
+            Move::Rotate(rotation) => (rotation.axis.unit(), rotation.multiplicity),
+        }
+    }
+}
+
+struct ActiveMove {
+    mv: Move,
+    /// indices into puzzle.pieces of the pieces the move rotates.
+    /// validated when the move started.
     pieces: Vec<usize>,
     mode: AnimMode,
 }
-impl ActiveTwist {
-    /// progress through the twist in [0, 1); >= 1 means finished.
+impl ActiveMove {
+    /// progress through the move in [0, 1); >= 1 means finished.
     fn progress(&self, now: Instant, duration: f32) -> f32 {
         match self.mode {
             AnimMode::Frame { progress, .. } => progress,
@@ -80,7 +98,10 @@ enum AnimStart {
 #[derive(Debug, Clone, Copy)]
 pub enum Action {
     Twist(Twist),
-    Rotate(Rotation),
+    Rotate(PuzzleRotation),
+    /// an Align re-basing: the puzzle state was rotated by this (one of the
+    /// 24 axis-aligned orientations) to agree with the view.
+    Align(Rot),
 }
 
 /// The puzzle simulation: latest puzzle state, twist queue + animation,
@@ -89,8 +110,8 @@ pub enum Action {
 /// filters, selection — lives in PuzzleView instead.)
 pub struct PuzzleSimulation {
     puzzle: PuzzleState,
-    twist_queue: VecDeque<(Twist, Origin)>,
-    active_twist: Option<ActiveTwist>,
+    move_queue: VecDeque<(Move, Origin)>,
+    active_move: Option<ActiveMove>,
     blocked_flash: Option<BlockedFlash>,
     undo_stack: Vec<Action>,
     redo_stack: Vec<Action>,
@@ -99,8 +120,8 @@ impl PuzzleSimulation {
     pub fn new(puzzle: PuzzleState) -> Self {
         Self {
             puzzle,
-            twist_queue: VecDeque::new(),
-            active_twist: None,
+            move_queue: VecDeque::new(),
+            active_move: None,
             blocked_flash: None,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -113,74 +134,130 @@ impl PuzzleSimulation {
     }
 
     /// Handle a command routed here by the hub. May return follow-up commands
-    /// for the hub to route elsewhere (e.g. undoing a rotation, which this
-    /// component records but the camera applies).
+    /// for the hub to route elsewhere (e.g. the view compensation when
+    /// undoing an Align).
     pub fn handle(&mut self, command: Command, now: Instant) -> Vec<Command> {
         match command {
             Command::Twist { twist, origin } => {
-                self.twist_queue.push_back((twist, origin));
+                self.move_queue.push_back((Move::Twist(twist), origin));
+                vec![]
+            }
+            Command::Rotate { rotation, origin } => {
+                self.move_queue.push_back((Move::Rotate(rotation), origin));
                 vec![]
             }
             Command::Undo => {
-                self.finish_queued_twists(now);
+                self.finish_queued_moves(now);
                 match self.undo_stack.pop() {
-                    Some(Action::Twist(twist)) => {
-                        self.redo_stack.push(Action::Twist(twist));
+                    Some(action @ Action::Twist(twist)) => {
+                        self.redo_stack.push(action);
                         // the inverse of an applied twist grips the same
                         // pieces, so it can't be blocked.
-                        self.twist_queue.push_back((twist.inv(), Origin::Undo));
+                        self.move_queue
+                            .push_back((Move::Twist(twist.inv()), Origin::Undo));
                         vec![]
                     }
-                    Some(Action::Rotate(rotation)) => {
-                        self.redo_stack.push(Action::Rotate(rotation));
-                        vec![Command::Rotate {
-                            rotation: rotation.inv(),
-                            origin: Origin::Undo,
-                        }]
+                    Some(action @ Action::Rotate(rotation)) => {
+                        self.redo_stack.push(action);
+                        self.move_queue
+                            .push_back((Move::Rotate(rotation.inv()), Origin::Undo));
+                        vec![]
+                    }
+                    Some(action @ Action::Align(orientation)) => {
+                        self.redo_stack.push(action);
+                        // undo the re-basing instantly and have the view
+                        // counter-rotate, so it's visually net-zero like the
+                        // align itself was.
+                        self.rotate_state(orientation.invert());
+                        vec![Command::RotateView(orientation)]
                     }
                     None => vec![],
                 }
             }
             Command::Redo => {
-                self.finish_queued_twists(now);
+                self.finish_queued_moves(now);
                 match self.redo_stack.pop() {
-                    Some(Action::Twist(twist)) => {
-                        self.undo_stack.push(Action::Twist(twist));
-                        self.twist_queue.push_back((twist, Origin::Redo));
+                    Some(action @ Action::Twist(twist)) => {
+                        self.undo_stack.push(action);
+                        self.move_queue
+                            .push_back((Move::Twist(twist), Origin::Redo));
                         vec![]
                     }
-                    Some(Action::Rotate(rotation)) => {
-                        self.undo_stack.push(Action::Rotate(rotation));
-                        vec![Command::Rotate {
-                            rotation,
-                            origin: Origin::Redo,
-                        }]
+                    Some(action @ Action::Rotate(rotation)) => {
+                        self.undo_stack.push(action);
+                        self.move_queue
+                            .push_back((Move::Rotate(rotation), Origin::Redo));
+                        vec![]
+                    }
+                    Some(action @ Action::Align(orientation)) => {
+                        self.undo_stack.push(action);
+                        self.rotate_state(orientation);
+                        vec![Command::RotateView(orientation.invert())]
                     }
                     None => vec![],
                 }
             }
-            _ => unreachable!("the hub routes only twist/undo/redo commands to the simulation"),
+            _ => unreachable!("the hub routes only twist/rotate/undo/redo commands here"),
         }
     }
 
-    /// Record a user rotation in the undo history. The camera applies
-    /// rotations; the hub calls this alongside.
-    pub fn record_rotation(&mut self, rotation: Rotation) {
-        self.undo_stack.push(Action::Rotate(rotation));
+    /// Re-base the puzzle state onto the view's axis-aligned orientation:
+    /// the hub computes `orientation` from the view (which keeps only the
+    /// sub-90° residual), and this rotates the state to match — visually
+    /// net-zero. After this, face keybinds mean what they look like.
+    pub fn align(&mut self, orientation: Rot, now: Instant) {
+        // an already-agreeing view is a no-op; don't pollute the history.
+        if orientation.s.abs() > 1.0 - 1e-6 {
+            return;
+        }
+        // pending moves were queued in the old frame's coordinates; finish
+        // them there before re-basing.
+        self.finish_queued_moves(now);
+        self.rotate_state(orientation);
+        self.undo_stack.push(Action::Align(orientation));
         self.redo_stack.clear();
     }
 
-    /// Apply the active and queued twists immediately, skipping animation.
-    /// Used before undo/redo so the history and the displayed state agree.
-    fn finish_queued_twists(&mut self, now: Instant) {
-        if let Some(active) = self.active_twist.take() {
-            self.puzzle
-                .twist(active.twist)
-                .expect("twist was validated when its animation started");
+    /// rotate every piece: a whole-puzzle rotation of the latest state.
+    fn rotate_state(&mut self, rot: Rot) {
+        for piece in &mut self.puzzle.pieces {
+            piece.rot = rot * piece.rot;
         }
-        while let Some((twist, origin)) = self.twist_queue.pop_front() {
-            match self.puzzle.twist(twist) {
-                Ok(()) => self.record_applied(twist, origin),
+    }
+
+    /// which pieces a move grips, or the blocking pieces. rotations grip
+    /// everything and can't be blocked.
+    fn move_pieces(&self, mv: Move) -> Result<Vec<usize>, TwistError> {
+        match mv {
+            Move::Twist(twist) => self.puzzle.twist_pieces(twist),
+            Move::Rotate(_) => Ok((0..self.puzzle.pieces.len()).collect()),
+        }
+    }
+
+    /// apply a move to the latest state. the twist must have been validated.
+    fn apply_move(&mut self, mv: Move) {
+        match mv {
+            Move::Twist(twist) => self
+                .puzzle
+                .twist(twist)
+                .expect("twist was validated when its animation started"),
+            Move::Rotate(rotation) => self.rotate_state(rotation.quat()),
+        }
+    }
+
+    /// Apply the active and queued moves immediately, skipping animation.
+    /// Used before undo/redo/align so the history, the state, and the
+    /// coordinate frame agree.
+    fn finish_queued_moves(&mut self, now: Instant) {
+        if let Some(active) = self.active_move.take() {
+            self.apply_move(active.mv);
+        }
+        while let Some((mv, origin)) = self.move_queue.pop_front() {
+            match self.move_pieces(mv) {
+                Ok(_) => {
+                    self.apply_move(mv);
+                    self.record_applied(mv, origin);
+                }
                 Err(e) => {
                     self.blocked_flash = Some(BlockedFlash {
                         pieces: e.blocked,
@@ -191,21 +268,24 @@ impl PuzzleSimulation {
         }
     }
 
-    /// history bookkeeping for a twist that passed validation. only user
-    /// twists are recorded: undo/redo replays are already accounted for by
+    /// history bookkeeping for a move that passed validation. only user
+    /// moves are recorded: undo/redo replays are already accounted for by
     /// the stack manipulation in `handle`.
-    fn record_applied(&mut self, twist: Twist, origin: Origin) {
+    fn record_applied(&mut self, mv: Move, origin: Origin) {
         if origin == Origin::User {
-            self.undo_stack.push(Action::Twist(twist));
+            self.undo_stack.push(match mv {
+                Move::Twist(twist) => Action::Twist(twist),
+                Move::Rotate(rotation) => Action::Rotate(rotation),
+            });
             self.redo_stack.clear();
         }
     }
 
-    /// per-frame animation tick: advance the active twist by one drawn frame,
+    /// per-frame animation tick: advance the active move by one drawn frame,
     /// apply it to the puzzle once finished, and chain into the queue.
     pub fn tick(&mut self, now: Instant, stable_dt: f32, twist_duration: f32) {
-        match &mut self.active_twist {
-            None => self.start_next_twist(AnimStart::Fresh, now, stable_dt, twist_duration),
+        match &mut self.active_move {
+            None => self.start_next_move(AnimStart::Fresh, now, stable_dt, twist_duration),
             Some(active) => {
                 // Time mode derives progress from the clock instead.
                 if let AnimMode::Frame { progress, n_frames } = &mut active.mode {
@@ -214,40 +294,38 @@ impl PuzzleSimulation {
             }
         }
 
-        // Apply finished twists. Loops because at very fast speeds
-        // (n_frames < 1) several twists can complete in one drawn frame.
+        // Apply finished moves. Loops because at very fast speeds
+        // (n_frames < 1) several moves can complete in one drawn frame.
         loop {
-            let Some(active) = &self.active_twist else {
+            let Some(active) = &self.active_move else {
                 return;
             };
             let p = active.progress(now, twist_duration);
             if p < 1.0 {
                 return;
             }
-            let twist = active.twist;
+            let mv = active.mv;
             let carry = match active.mode {
                 AnimMode::Frame { progress, .. } => AnimStart::CarryFrames(progress - 1.0),
                 AnimMode::Time { start } => {
                     AnimStart::CarryTime(start + Duration::from_secs_f32(twist_duration))
                 }
             };
-            self.puzzle
-                .twist(twist)
-                .expect("twist was validated when its animation started");
-            self.active_twist = None;
-            self.start_next_twist(carry, now, stable_dt, twist_duration);
+            self.apply_move(mv);
+            self.active_move = None;
+            self.start_next_move(carry, now, stable_dt, twist_duration);
         }
     }
 
-    fn start_next_twist(
+    fn start_next_move(
         &mut self,
         start: AnimStart,
         now: Instant,
         stable_dt: f32,
         twist_duration: f32,
     ) {
-        while let Some((twist, origin)) = self.twist_queue.pop_front() {
-            let pieces = match self.puzzle.twist_pieces(twist) {
+        while let Some((mv, origin)) = self.move_queue.pop_front() {
+            let pieces = match self.move_pieces(mv) {
                 Ok(pieces) => pieces,
                 // blocked: drop the twist and flash the blocking pieces.
                 Err(e) => {
@@ -258,7 +336,7 @@ impl PuzzleSimulation {
                     continue;
                 }
             };
-            self.record_applied(twist, origin);
+            self.record_applied(mv, origin);
             let n_frames = twist_duration / stable_dt.clamp(1e-4, 1.0);
             let mode = if n_frames < FAST_MODE_MAX_FRAMES {
                 let progress = match start {
@@ -281,24 +359,20 @@ impl PuzzleSimulation {
                 };
                 AnimMode::Time { start }
             };
-            self.active_twist = Some(ActiveTwist {
-                twist,
-                pieces,
-                mode,
-            });
+            self.active_move = Some(ActiveMove { mv, pieces, mode });
             return;
         }
     }
 
-    /// Partial rotation of the animating layer's pieces, as a piece mask and
-    /// the rotation to compose onto them. The angle formula must match
-    /// PuzzleState::twist exactly so progress 1 converges to the applied
-    /// state.
+    /// Partial rotation of the animating move's pieces, as a piece mask and
+    /// the rotation to compose onto them. The angle formula must match the
+    /// applied move exactly so progress 1 converges to the applied state.
     pub fn anim(&self, now: Instant, twist_duration: f32) -> Option<(Vec<bool>, Rot)> {
-        self.active_twist.as_ref().map(|active| {
+        self.active_move.as_ref().map(|active| {
             let p = ease(active.progress(now, twist_duration));
-            let angle = -active.twist.multiplicity as f32 * std::f32::consts::FRAC_PI_4 * p;
-            let rot = Rot::from_axis_angle(active.twist.side.plane(), cgmath::Rad(angle));
+            let (axis, multiplicity) = active.mv.axis_multiplicity();
+            let angle = -multiplicity as f32 * std::f32::consts::FRAC_PI_4 * p;
+            let rot = Rot::from_axis_angle(axis, cgmath::Rad(angle));
             let mut mask = vec![false; self.puzzle.pieces.len()];
             for &i in &active.pieces {
                 mask[i] = true;
@@ -319,5 +393,69 @@ impl PuzzleSimulation {
             }
             (mask, strength)
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cgmath::AbsDiffEq;
+
+    use super::*;
+    use crate::commands::Axis;
+
+    const ID: Rot = Rot::new(1.0, 0.0, 0.0, 0.0);
+
+    /// tick with a tiny duration so every queued move applies immediately.
+    fn settle(sim: &mut PuzzleSimulation, now: Instant) {
+        for _ in 0..4 {
+            sim.tick(now, 1.0, 1e-3);
+        }
+    }
+
+    #[test]
+    fn rotate_then_undo_restores_orientation() {
+        let now = Instant::now();
+        let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
+        let y90 = PuzzleRotation::new(Axis::Y, 2);
+
+        sim.handle(
+            Command::Rotate {
+                rotation: y90,
+                origin: Origin::User,
+            },
+            now,
+        );
+        settle(&mut sim, now);
+        assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&y90.quat(), 1e-6));
+
+        assert!(sim.handle(Command::Undo, now).is_empty());
+        settle(&mut sim, now);
+        assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&ID, 1e-6));
+    }
+
+    #[test]
+    fn align_is_recorded_and_undo_counter_rotates_the_view() {
+        let now = Instant::now();
+        let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
+        let a = PuzzleRotation::new(Axis::X, 2).quat();
+
+        sim.align(a, now);
+        assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));
+
+        // undo restores the state instantly and asks the hub to counter-
+        // rotate the view so the re-basing stays visually net-zero.
+        let follow = sim.handle(Command::Undo, now);
+        assert!(
+            matches!(follow[..], [Command::RotateView(g)] if g.abs_diff_eq(&a, 1e-6)),
+            "unexpected follow-ups: {follow:?}"
+        );
+        assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&ID, 1e-6));
+
+        // an align at an already-agreeing orientation is a history no-op
+        // (in particular it must not clear the redo stack).
+        sim.align(ID, now);
+        let follow = sim.handle(Command::Redo, now);
+        assert_eq!(follow.len(), 1);
+        assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));
     }
 }

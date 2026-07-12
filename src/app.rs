@@ -45,16 +45,17 @@ impl App {
     fn route_commands(&mut self, now: Instant) {
         while let Some(command) = self.queue.pop_front() {
             match command {
-                Command::Twist { .. } | Command::Undo | Command::Redo => {
+                Command::Twist { .. } | Command::Rotate { .. } | Command::Undo | Command::Redo => {
                     self.queue.extend(self.sim.handle(command, now));
                 }
-                Command::Rotate { rotation, origin } => {
-                    if origin == Origin::User {
-                        self.sim.record_rotation(rotation);
-                    }
-                    self.puzzle_view.apply_rotation(rotation, now);
+                // align spans two components: the view keeps its sub-90°
+                // residual and the simulation bakes the axis-aligned part
+                // into the puzzle state.
+                Command::Align => {
+                    let orientation = self.puzzle_view.align(now);
+                    self.sim.align(orientation, now);
                 }
-                Command::Align => self.puzzle_view.align(now),
+                Command::RotateView(rot) => self.puzzle_view.rotate_view(rot),
                 Command::TogglePieceSelection(piece_idx) => {
                     self.puzzle_view.toggle_selection(piece_idx);
                 }
@@ -124,7 +125,6 @@ impl eframe::App for App {
                 .interact(&self.sim, &response, self.layer, now);
             self.queue.extend(commands);
             let input_context = InputContext {
-                alignment: self.puzzle_view.alignment(),
                 layer: self.layer,
                 hovered_gizmo: hover.gizmo,
             };
