@@ -2,7 +2,7 @@ use eframe::egui;
 
 use crate::{
     commands::{Command, Origin},
-    puzzle_state::{Axis, Rotation, Side, Twist},
+    puzzle_state::{Axis, Reorientation, Side, Twist},
 };
 
 /// What the input system gets to see when resolving bindings, beyond the raw
@@ -27,7 +27,7 @@ pub struct InputContext {
 /// match what you see.
 ///
 /// - `r u f l d b`: twist that face, CCW like left-click; Shift = CW.
-/// - `x y z`: rotate the whole puzzle 90° about that axis (cuber sense:
+/// - `x y z`: reorient the whole puzzle 90° about that axis (cuber sense:
 ///   plain `y` turns like a U twist); Shift inverts.
 /// - `Space`: align — make the puzzle state agree with the view.
 /// - `Cmd+Z` / `Cmd+Shift+Z`: undo / redo.
@@ -92,8 +92,8 @@ impl Keybinds {
             }
             if let Some(axis) = axis {
                 let multiplicity = if modifiers.shift { -2 } else { 2 };
-                commands.push(Command::Rotate {
-                    rotation: Rotation::new(axis, multiplicity),
+                commands.push(Command::Reorient {
+                    reorientation: Reorientation::new(axis, multiplicity),
                     origin: Origin::User,
                 });
             }

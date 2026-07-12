@@ -100,7 +100,10 @@ impl App {
     fn route_commands(&mut self, now: Instant) {
         while let Some(command) = self.queue.pop_front() {
             match command {
-                Command::Twist { .. } | Command::Rotate { .. } | Command::Undo | Command::Redo => {
+                Command::Twist { .. }
+                | Command::Reorient { .. }
+                | Command::Undo
+                | Command::Redo => {
                     self.sim.handle(command, now);
                 }
                 // align spans two components: the view keeps its sub-90°

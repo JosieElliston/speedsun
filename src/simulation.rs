@@ -21,14 +21,14 @@ pub fn ease(t: f32) -> f32 {
     0.5 - 0.5 * (t * std::f32::consts::PI).cos()
 }
 
-/// a state-changing move: a layer twist or a whole-puzzle rotation. separate
-/// variants because rotations grip every piece and can never be blocked.
-/// doubles as the undo-history entry (an Align is recorded as the rotation
-/// it induced, so the history is nothing but moves).
+/// a state-changing move: a layer twist or a whole-puzzle reorientation.
+/// separate variants because reorientations grip every piece and can never
+/// be blocked. doubles as the undo-history entry (an Align is recorded as
+/// the reorientation it induced, so the history is nothing but moves).
 #[derive(Debug, Clone, Copy)]
 enum Move {
     Twist(Twist),
-    Rotate(Rotation),
+    Reorient(Reorientation),
 }
 impl Move {
     /// rotation axis (unit) and angle in radians, for pacing the animation.
@@ -38,14 +38,14 @@ impl Move {
                 twist.side.plane(),
                 -twist.multiplicity as f32 * std::f32::consts::FRAC_PI_4,
             ),
-            Move::Rotate(rotation) => rotation.axis_angle(),
+            Move::Reorient(reorientation) => reorientation.axis_angle(),
         }
     }
 
     fn inv(self) -> Self {
         match self {
             Move::Twist(twist) => Move::Twist(twist.inv()),
-            Move::Rotate(rotation) => Move::Rotate(rotation.inv()),
+            Move::Reorient(reorientation) => Move::Reorient(reorientation.inv()),
         }
     }
 }
@@ -139,8 +139,12 @@ impl PuzzleSimulation {
             Command::Twist { twist, origin } => {
                 self.move_queue.push_back((Move::Twist(twist), origin));
             }
-            Command::Rotate { rotation, origin } => {
-                self.move_queue.push_back((Move::Rotate(rotation), origin));
+            Command::Reorient {
+                reorientation,
+                origin,
+            } => {
+                self.move_queue
+                    .push_back((Move::Reorient(reorientation), origin));
             }
             Command::Undo => {
                 self.finish_queued_moves(now);
@@ -158,7 +162,7 @@ impl PuzzleSimulation {
                     self.move_queue.push_back((mv, Origin::Redo));
                 }
             }
-            _ => unreachable!("the hub routes only twist/rotate/undo/redo commands here"),
+            _ => unreachable!("the hub routes only twist/reorient/undo/redo commands here"),
         }
     }
 
@@ -166,8 +170,9 @@ impl PuzzleSimulation {
     /// the hub computes `orientation` from the view (which keeps only the
     /// sub-90° residual), and this rotates the state to match — visually
     /// net-zero. After this, face keybinds mean what they look like.
-    /// Recorded in the history as the induced rotation, so undoing past an
-    /// align rotates the puzzle back in view like any other rotation.
+    /// Recorded in the history as the induced reorientation, so undoing
+    /// past an align rotates the puzzle back in view like any other
+    /// reorientation.
     pub fn align(&mut self, orientation: Rot, now: Instant) {
         // an already-agreeing view is a no-op; don't pollute the history.
         if orientation.s.abs() > 1.0 - 1e-6 {
@@ -176,18 +181,18 @@ impl PuzzleSimulation {
         // pending moves were queued in the old frame's coordinates; finish
         // them there before re-basing.
         self.finish_queued_moves(now);
-        let rotation = Rotation::from_quat(orientation);
-        self.puzzle.rotate(rotation);
-        self.undo_stack.push(Move::Rotate(rotation));
+        let reorientation = Reorientation::from_quat(orientation);
+        self.puzzle.reorient(reorientation);
+        self.undo_stack.push(Move::Reorient(reorientation));
         self.redo_stack.clear();
     }
 
-    /// which pieces a move grips, or the blocking pieces. rotations grip
-    /// everything and can't be blocked.
+    /// which pieces a move grips, or the blocking pieces. reorientations
+    /// grip everything and can't be blocked.
     fn move_pieces(&self, mv: Move) -> Result<Vec<usize>, TwistError> {
         match mv {
             Move::Twist(twist) => self.puzzle.twist_pieces(twist),
-            Move::Rotate(_) => Ok((0..self.puzzle.pieces.len()).collect()),
+            Move::Reorient(_) => Ok((0..self.puzzle.pieces.len()).collect()),
         }
     }
 
@@ -198,7 +203,7 @@ impl PuzzleSimulation {
                 .puzzle
                 .twist(twist)
                 .expect("twist was validated when its animation started"),
-            Move::Rotate(rotation) => self.puzzle.rotate(rotation),
+            Move::Reorient(reorientation) => self.puzzle.reorient(reorientation),
         }
     }
 
@@ -365,14 +370,14 @@ mod tests {
     }
 
     #[test]
-    fn rotate_then_undo_restores_orientation() {
+    fn reorient_then_undo_restores_orientation() {
         let now = Instant::now();
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
-        let y90 = Rotation::new(Axis::Y, 2);
+        let y90 = Reorientation::new(Axis::Y, 2);
 
         sim.handle(
-            Command::Rotate {
-                rotation: y90,
+            Command::Reorient {
+                reorientation: y90,
                 origin: Origin::User,
             },
             now,
@@ -386,23 +391,23 @@ mod tests {
     }
 
     /// equality up to the quaternion double cover (q and -q are the same
-    /// rotation; align records rotations recomposed from `decompose`, whose
-    /// hemisphere is unspecified).
+    /// rotation; align records a reorientation whose hemisphere is
+    /// canonicalized, not necessarily the input's).
     fn same_rot(a: Rot, b: Rot) -> bool {
         a.abs_diff_eq(&b, 1e-6) || a.abs_diff_eq(&-b, 1e-6)
     }
 
     #[test]
-    fn align_records_its_induced_rotation() {
+    fn align_records_its_induced_reorientation() {
         let now = Instant::now();
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
-        let a = Rotation::new(Axis::X, 2).quat();
+        let a = Reorientation::new(Axis::X, 2).quat();
 
         sim.align(a, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));
 
         // undo rotates the puzzle back in view, like undoing an ordinary
-        // whole-puzzle rotation; the view is not involved.
+        // reorientation; the view is not involved.
         sim.handle(Command::Undo, now);
         settle(&mut sim, now);
         assert!(same_rot(sim.puzzle().pieces[0].rot, ID));
@@ -421,7 +426,7 @@ mod tests {
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
         // a vertex orientation: not a rotation about a single coordinate
         // axis, but still a single history entry (one 120° rotation).
-        let a = Rotation::new(Axis::X, 2).quat() * Rotation::new(Axis::Y, 2).quat();
+        let a = Reorientation::new(Axis::X, 2).quat() * Reorientation::new(Axis::Y, 2).quat();
 
         sim.align(a, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));

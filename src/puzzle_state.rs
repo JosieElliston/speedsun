@@ -444,18 +444,18 @@ impl Axis {
     }
 }
 
-/// a whole-puzzle rotation (every piece rotates): always one of the cube's
-/// 24 axis-aligned orientations, never a 45 deg step — there is no coherent
-/// face-key mapping for a 45 deg rotated puzzle.
+/// a whole-puzzle reorientation (every piece rotates): always one of the
+/// cube's 24 axis-aligned orientations, never a 45 deg step — there is no
+/// coherent face-key mapping for a 45 deg rotated puzzle.
 #[derive(Debug, Clone, Copy)]
-pub struct Rotation(Rot);
-impl Rotation {
+pub struct Reorientation(Rot);
+impl Reorientation {
     /// `multiplicity` matches `Twist`'s convention (1 is a 45 deg turn), so
     /// it must always be even.
     pub fn new(axis: Axis, multiplicity: i8) -> Self {
         debug_assert!(
             multiplicity % 2 == 0,
-            "whole-puzzle rotations must be multiples of 90 deg"
+            "reorientations must be multiples of 90 deg"
         );
         let angle = -multiplicity as f32 * std::f32::consts::FRAC_PI_4;
         Self::from_quat(Rot::from_axis_angle(axis.unit(), cgmath::Rad(angle)))
@@ -613,11 +613,11 @@ impl PuzzleState {
         Ok(())
     }
 
-    /// rotate the whole puzzle: every piece. unlike `twist`, a rotation
-    /// grips everything and so can't be blocked.
-    pub fn rotate(&mut self, rotation: Rotation) {
+    /// reorient the whole puzzle: every piece. unlike `twist`, a
+    /// reorientation grips everything and so can't be blocked.
+    pub fn reorient(&mut self, reorientation: Reorientation) {
         for piece in &mut self.pieces {
-            piece.rot = rotation.quat() * piece.rot;
+            piece.rot = reorientation.quat() * piece.rot;
         }
     }
 }
@@ -776,12 +776,12 @@ mod tests {
     }
 
     #[test]
-    fn rotation_from_quat_canonicalizes_and_round_trips() {
+    fn reorientation_from_quat_canonicalizes_and_round_trips() {
         // 270 deg about X lands in the s < 0 hemisphere; canonicalization
         // flips it so the extracted animation runs 90 deg the short way.
         let q = Rot::from_axis_angle(Vec3::unit_x(), cgmath::Rad(1.5 * std::f32::consts::PI));
         assert!(q.s < 0.0);
-        let r = Rotation::from_quat(q);
+        let r = Reorientation::from_quat(q);
         assert!(r.quat().s >= 0.0);
         assert!(r.quat().abs_diff_eq(&-q, 1e-6));
 
