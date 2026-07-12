@@ -11,6 +11,25 @@ use crate::{
     simulation::PuzzleSimulation,
 };
 
+/// Which subsystem's UI the sidebar shows (HSC2-style, minus the icons).
+#[derive(Clone, Copy, PartialEq)]
+enum SidebarTab {
+    Twists,
+    View,
+    Filters,
+}
+impl SidebarTab {
+    const ALL: [Self; 3] = [Self::Twists, Self::View, Self::Filters];
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Twists => "Twists",
+            Self::View => "View",
+            Self::Filters => "Filters",
+        }
+    }
+}
+
 /// The hub: owns every component and routes `Command`s between them each
 /// frame. Components never reference each other; anything cross-component
 /// goes through `queue`, which is also where a future log file will observe
@@ -21,6 +40,7 @@ pub struct App {
     keybinds: Keybinds,
     layer: u8,
     filters: Filters,
+    sidebar_tab: SidebarTab,
     queue: VecDeque<Command>,
 }
 impl App {
@@ -35,7 +55,34 @@ impl App {
             keybinds: Keybinds,
             layer: 0,
             filters: Filters::default(),
+            sidebar_tab: SidebarTab::Twists,
             queue: VecDeque::new(),
+        }
+    }
+
+    /// twist-input sidebar tab: layer slider + a button per face twist.
+    fn twists_ui(&mut self, ui: &mut egui::Ui) {
+        ui.add(egui::Slider::new(&mut self.layer, 0..=2).text("layer"));
+        for side in Side::ALL {
+            ui.horizontal(|ui| {
+                for multiplicity in [-1, 1] {
+                    let label = if multiplicity < 0 {
+                        format!("{side:?}'")
+                    } else {
+                        format!("{side:?}")
+                    };
+                    if ui.button(label).clicked() {
+                        self.queue.push_back(Command::Twist {
+                            twist: Twist {
+                                side,
+                                layer: self.layer,
+                                multiplicity,
+                            },
+                            origin: Origin::User,
+                        });
+                    }
+                }
+            });
         }
     }
 
@@ -69,41 +116,22 @@ impl eframe::App for App {
         ui.ctx().request_repaint();
         let now = Instant::now();
 
-        egui::Panel::left("left").show(ui, |ui| {
-            ui.heading("speedsun");
-            ui.separator();
-            ui.label("twist input");
-            ui.add(egui::Slider::new(&mut self.layer, 0..=2).text("layer"));
-            for side in Side::ALL {
-                ui.horizontal(|ui| {
-                    for multiplicity in [-1, 1] {
-                        let label = if multiplicity < 0 {
-                            format!("{side:?}'")
-                        } else {
-                            format!("{side:?}")
-                        };
-                        if ui.button(label).clicked() {
-                            self.queue.push_back(Command::Twist {
-                                twist: Twist {
-                                    side,
-                                    layer: self.layer,
-                                    multiplicity,
-                                },
-                                origin: Origin::User,
-                            });
+        egui::Panel::left("sidebar").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.heading("speedsun");
+                egui::ComboBox::from_id_salt("sidebar_tab")
+                    .selected_text(self.sidebar_tab.name())
+                    .show_ui(ui, |ui| {
+                        for tab in SidebarTab::ALL {
+                            ui.selectable_value(&mut self.sidebar_tab, tab, tab.name());
                         }
-                    }
-                });
-            }
-
+                    });
+            });
             ui.separator();
-            ui.label("view");
-            self.puzzle_view.ui(ui);
-        });
-
-        egui::Panel::right("filters").show(ui, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                self.filters.ui(ui);
+            egui::ScrollArea::vertical().show(ui, |ui| match self.sidebar_tab {
+                SidebarTab::Twists => self.twists_ui(ui),
+                SidebarTab::View => self.puzzle_view.ui(ui),
+                SidebarTab::Filters => self.filters.ui(ui),
             });
         });
 
