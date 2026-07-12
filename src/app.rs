@@ -96,13 +96,12 @@ impl App {
     }
 
     /// drain the command queue, routing each command to the component that
-    /// owns it. components may push follow-up commands (e.g. undoing a
-    /// rotation: the simulation records it, the camera applies it).
+    /// owns it.
     fn route_commands(&mut self, now: Instant) {
         while let Some(command) = self.queue.pop_front() {
             match command {
                 Command::Twist { .. } | Command::Rotate { .. } | Command::Undo | Command::Redo => {
-                    self.queue.extend(self.sim.handle(command, now));
+                    self.sim.handle(command, now);
                 }
                 // align spans two components: the view keeps its sub-90°
                 // residual and the simulation bakes the axis-aligned part
@@ -111,7 +110,6 @@ impl App {
                     let orientation = self.puzzle_view.align(now);
                     self.sim.align(orientation, now);
                 }
-                Command::RotateView(rot) => self.puzzle_view.rotate_view(rot),
                 Command::TogglePieceSelection(piece_idx) => {
                     self.puzzle_view.toggle_selection(piece_idx);
                 }

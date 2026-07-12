@@ -176,17 +176,6 @@ impl PuzzleView {
         a
     }
 
-    /// compose `rot` (puzzle-space) onto the view without touching the
-    /// puzzle state: the cosmetic compensation that keeps undoing/redoing an
-    /// Align visually net-zero.
-    pub fn rotate_view(&mut self, rot: Rot) {
-        self.rot = self.rot * rot;
-        if let Some(snap) = &mut self.snap {
-            snap.from = snap.from * rot;
-            snap.to = snap.to * rot;
-        }
-    }
-
     pub fn toggle_selection(&mut self, piece_idx: usize) {
         if !self.selected_pieces.remove(&piece_idx) {
             self.selected_pieces.insert(piece_idx);

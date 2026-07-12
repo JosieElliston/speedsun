@@ -3,7 +3,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cgmath::{Rotation, Rotation3};
+use cgmath::Rotation3;
 
 use crate::{
     commands::{Command, Origin, Rotation as PuzzleRotation},
@@ -22,7 +22,9 @@ pub fn ease(t: f32) -> f32 {
 }
 
 /// a state-changing move: a layer twist or a whole-puzzle rotation. separate
-/// types because rotations grip every piece and can never be blocked.
+/// variants because rotations grip every piece and can never be blocked.
+/// doubles as the undo-history entry (an Align is recorded as the rotations
+/// it induced, so the history is nothing but moves).
 #[derive(Debug, Clone, Copy)]
 enum Move {
     Twist(Twist),
@@ -35,6 +37,13 @@ impl Move {
         match self {
             Move::Twist(twist) => (twist.side.plane(), twist.multiplicity),
             Move::Rotate(rotation) => (rotation.axis.unit(), rotation.multiplicity),
+        }
+    }
+
+    fn inv(self) -> Self {
+        match self {
+            Move::Twist(twist) => Move::Twist(twist.inv()),
+            Move::Rotate(rotation) => Move::Rotate(rotation.inv()),
         }
     }
 }
@@ -93,17 +102,6 @@ enum AnimStart {
     CarryTime(Instant),
 }
 
-/// an entry in the undo history: the state-relevant moves, as applied.
-/// (blocked twists are dropped before they get here.)
-#[derive(Debug, Clone, Copy)]
-pub enum Action {
-    Twist(Twist),
-    Rotate(PuzzleRotation),
-    /// an Align re-basing: the puzzle state was rotated by this (one of the
-    /// 24 axis-aligned orientations) to agree with the view.
-    Align(Rot),
-}
-
 /// The puzzle simulation: latest puzzle state, twist queue + animation,
 /// blocked-twist feedback, and undo/redo history. Sole writer of PuzzleState.
 /// (Modeled on HSC2's PuzzleSimulation; view-specific state — camera,
@@ -113,8 +111,8 @@ pub struct PuzzleSimulation {
     move_queue: VecDeque<(Move, Origin)>,
     active_move: Option<ActiveMove>,
     blocked_flash: Option<BlockedFlash>,
-    undo_stack: Vec<Action>,
-    redo_stack: Vec<Action>,
+    undo_stack: Vec<Move>,
+    redo_stack: Vec<Move>,
 }
 impl PuzzleSimulation {
     pub fn new(puzzle: PuzzleState) -> Self {
@@ -133,68 +131,29 @@ impl PuzzleSimulation {
         &self.puzzle
     }
 
-    /// Handle a command routed here by the hub. May return follow-up commands
-    /// for the hub to route elsewhere (e.g. the view compensation when
-    /// undoing an Align).
-    pub fn handle(&mut self, command: Command, now: Instant) -> Vec<Command> {
+    /// Handle a command routed here by the hub.
+    pub fn handle(&mut self, command: Command, now: Instant) {
         match command {
             Command::Twist { twist, origin } => {
                 self.move_queue.push_back((Move::Twist(twist), origin));
-                vec![]
             }
             Command::Rotate { rotation, origin } => {
                 self.move_queue.push_back((Move::Rotate(rotation), origin));
-                vec![]
             }
             Command::Undo => {
                 self.finish_queued_moves(now);
-                match self.undo_stack.pop() {
-                    Some(action @ Action::Twist(twist)) => {
-                        self.redo_stack.push(action);
-                        // the inverse of an applied twist grips the same
-                        // pieces, so it can't be blocked.
-                        self.move_queue
-                            .push_back((Move::Twist(twist.inv()), Origin::Undo));
-                        vec![]
-                    }
-                    Some(action @ Action::Rotate(rotation)) => {
-                        self.redo_stack.push(action);
-                        self.move_queue
-                            .push_back((Move::Rotate(rotation.inv()), Origin::Undo));
-                        vec![]
-                    }
-                    Some(action @ Action::Align(orientation)) => {
-                        self.redo_stack.push(action);
-                        // undo the re-basing instantly and have the view
-                        // counter-rotate, so it's visually net-zero like the
-                        // align itself was.
-                        self.rotate_state(orientation.invert());
-                        vec![Command::RotateView(orientation)]
-                    }
-                    None => vec![],
+                if let Some(mv) = self.undo_stack.pop() {
+                    self.redo_stack.push(mv);
+                    // the inverse of an applied move grips the same pieces,
+                    // so it can't be blocked.
+                    self.move_queue.push_back((mv.inv(), Origin::Undo));
                 }
             }
             Command::Redo => {
                 self.finish_queued_moves(now);
-                match self.redo_stack.pop() {
-                    Some(action @ Action::Twist(twist)) => {
-                        self.undo_stack.push(action);
-                        self.move_queue
-                            .push_back((Move::Twist(twist), Origin::Redo));
-                        vec![]
-                    }
-                    Some(action @ Action::Rotate(rotation)) => {
-                        self.undo_stack.push(action);
-                        self.move_queue
-                            .push_back((Move::Rotate(rotation), Origin::Redo));
-                        vec![]
-                    }
-                    Some(action @ Action::Align(orientation)) => {
-                        self.undo_stack.push(action);
-                        self.rotate_state(orientation);
-                        vec![Command::RotateView(orientation.invert())]
-                    }
-                    None => vec![],
+                if let Some(mv) = self.redo_stack.pop() {
+                    self.undo_stack.push(mv);
+                    self.move_queue.push_back((mv, Origin::Redo));
                 }
             }
             _ => unreachable!("the hub routes only twist/rotate/undo/redo commands here"),
@@ -205,6 +164,8 @@ impl PuzzleSimulation {
     /// the hub computes `orientation` from the view (which keeps only the
     /// sub-90° residual), and this rotates the state to match — visually
     /// net-zero. After this, face keybinds mean what they look like.
+    /// Recorded in the history as the induced rotation(s), so undoing past
+    /// an align rotates the puzzle back in view like any other rotation.
     pub fn align(&mut self, orientation: Rot, now: Instant) {
         // an already-agreeing view is a no-op; don't pollute the history.
         if orientation.s.abs() > 1.0 - 1e-6 {
@@ -214,7 +175,9 @@ impl PuzzleSimulation {
         // them there before re-basing.
         self.finish_queued_moves(now);
         self.rotate_state(orientation);
-        self.undo_stack.push(Action::Align(orientation));
+        for rotation in PuzzleRotation::decompose(orientation) {
+            self.undo_stack.push(Move::Rotate(rotation));
+        }
         self.redo_stack.clear();
     }
 
@@ -273,10 +236,7 @@ impl PuzzleSimulation {
     /// the stack manipulation in `handle`.
     fn record_applied(&mut self, mv: Move, origin: Origin) {
         if origin == Origin::User {
-            self.undo_stack.push(match mv {
-                Move::Twist(twist) => Action::Twist(twist),
-                Move::Rotate(rotation) => Action::Rotate(rotation),
-            });
+            self.undo_stack.push(mv);
             self.redo_stack.clear();
         }
     }
@@ -428,13 +388,20 @@ mod tests {
         settle(&mut sim, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&y90.quat(), 1e-6));
 
-        assert!(sim.handle(Command::Undo, now).is_empty());
+        sim.handle(Command::Undo, now);
         settle(&mut sim, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&ID, 1e-6));
     }
 
+    /// equality up to the quaternion double cover (q and -q are the same
+    /// rotation; align records rotations recomposed from `decompose`, whose
+    /// hemisphere is unspecified).
+    fn same_rot(a: Rot, b: Rot) -> bool {
+        a.abs_diff_eq(&b, 1e-6) || a.abs_diff_eq(&-b, 1e-6)
+    }
+
     #[test]
-    fn align_is_recorded_and_undo_counter_rotates_the_view() {
+    fn align_records_its_induced_rotation() {
         let now = Instant::now();
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
         let a = PuzzleRotation::new(Axis::X, 2).quat();
@@ -442,20 +409,37 @@ mod tests {
         sim.align(a, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));
 
-        // undo restores the state instantly and asks the hub to counter-
-        // rotate the view so the re-basing stays visually net-zero.
-        let follow = sim.handle(Command::Undo, now);
-        assert!(
-            matches!(follow[..], [Command::RotateView(g)] if g.abs_diff_eq(&a, 1e-6)),
-            "unexpected follow-ups: {follow:?}"
-        );
-        assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&ID, 1e-6));
+        // undo rotates the puzzle back in view, like undoing an ordinary
+        // whole-puzzle rotation; the view is not involved.
+        sim.handle(Command::Undo, now);
+        settle(&mut sim, now);
+        assert!(same_rot(sim.puzzle().pieces[0].rot, ID));
 
         // an align at an already-agreeing orientation is a history no-op
         // (in particular it must not clear the redo stack).
         sim.align(ID, now);
-        let follow = sim.handle(Command::Redo, now);
-        assert_eq!(follow.len(), 1);
+        sim.handle(Command::Redo, now);
+        settle(&mut sim, now);
+        assert!(same_rot(sim.puzzle().pieces[0].rot, a));
+    }
+
+    #[test]
+    fn two_step_alignment_undoes_in_two_steps() {
+        let now = Instant::now();
+        let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
+        // a vertex orientation: not a rotation about a single coordinate
+        // axis, so align records two rotations.
+        let a = PuzzleRotation::new(Axis::X, 2).quat() * PuzzleRotation::new(Axis::Y, 2).quat();
+
+        sim.align(a, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));
+
+        sim.handle(Command::Undo, now);
+        settle(&mut sim, now);
+        assert!(!same_rot(sim.puzzle().pieces[0].rot, ID));
+
+        sim.handle(Command::Undo, now);
+        settle(&mut sim, now);
+        assert!(same_rot(sim.puzzle().pieces[0].rot, ID));
     }
 }
