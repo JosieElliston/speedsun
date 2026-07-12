@@ -6,7 +6,7 @@ use std::{
 use cgmath::Rotation3;
 
 use crate::{
-    commands::{Command, Origin, Rotation as PuzzleRotation},
+    commands::{Command, Origin},
     puzzle_state::*,
 };
 
@@ -28,7 +28,7 @@ pub fn ease(t: f32) -> f32 {
 #[derive(Debug, Clone, Copy)]
 enum Move {
     Twist(Twist),
-    Rotate(PuzzleRotation),
+    Rotate(Rotation),
 }
 impl Move {
     /// rotation axis (unit) and angle in radians, for pacing the animation.
@@ -176,17 +176,10 @@ impl PuzzleSimulation {
         // pending moves were queued in the old frame's coordinates; finish
         // them there before re-basing.
         self.finish_queued_moves(now);
-        self.rotate_state(orientation);
-        self.undo_stack
-            .push(Move::Rotate(PuzzleRotation::from_quat(orientation)));
+        let rotation = Rotation::from_quat(orientation);
+        self.puzzle.rotate(rotation);
+        self.undo_stack.push(Move::Rotate(rotation));
         self.redo_stack.clear();
-    }
-
-    /// rotate every piece: a whole-puzzle rotation of the latest state.
-    fn rotate_state(&mut self, rot: Rot) {
-        for piece in &mut self.puzzle.pieces {
-            piece.rot = rot * piece.rot;
-        }
     }
 
     /// which pieces a move grips, or the blocking pieces. rotations grip
@@ -205,7 +198,7 @@ impl PuzzleSimulation {
                 .puzzle
                 .twist(twist)
                 .expect("twist was validated when its animation started"),
-            Move::Rotate(rotation) => self.rotate_state(rotation.quat()),
+            Move::Rotate(rotation) => self.puzzle.rotate(rotation),
         }
     }
 
@@ -361,7 +354,6 @@ mod tests {
     use cgmath::AbsDiffEq;
 
     use super::*;
-    use crate::commands::Axis;
 
     const ID: Rot = Rot::new(1.0, 0.0, 0.0, 0.0);
 
@@ -376,7 +368,7 @@ mod tests {
     fn rotate_then_undo_restores_orientation() {
         let now = Instant::now();
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
-        let y90 = PuzzleRotation::new(Axis::Y, 2);
+        let y90 = Rotation::new(Axis::Y, 2);
 
         sim.handle(
             Command::Rotate {
@@ -404,7 +396,7 @@ mod tests {
     fn align_records_its_induced_rotation() {
         let now = Instant::now();
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
-        let a = PuzzleRotation::new(Axis::X, 2).quat();
+        let a = Rotation::new(Axis::X, 2).quat();
 
         sim.align(a, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));
@@ -429,7 +421,7 @@ mod tests {
         let mut sim = PuzzleSimulation::new(PuzzleState::uncut());
         // a vertex orientation: not a rotation about a single coordinate
         // axis, but still a single history entry (one 120° rotation).
-        let a = PuzzleRotation::new(Axis::X, 2).quat() * PuzzleRotation::new(Axis::Y, 2).quat();
+        let a = Rotation::new(Axis::X, 2).quat() * Rotation::new(Axis::Y, 2).quat();
 
         sim.align(a, now);
         assert!(sim.puzzle().pieces[0].rot.abs_diff_eq(&a, 1e-6));

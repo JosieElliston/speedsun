@@ -1,8 +1,8 @@
 use eframe::egui;
 
 use crate::{
-    commands::{Axis, Command, Origin, Rotation},
-    puzzle_state::{Side, Twist},
+    commands::{Command, Origin},
+    puzzle_state::{Axis, Rotation, Side, Twist},
 };
 
 /// What the input system gets to see when resolving bindings, beyond the raw

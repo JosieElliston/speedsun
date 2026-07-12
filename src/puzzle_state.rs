@@ -1,4 +1,4 @@
-use cgmath::{InnerSpace, Rotation, Rotation3};
+use cgmath::{InnerSpace, Rotation as _, Rotation3};
 use eframe::egui;
 
 // in [-1, 1]^3
@@ -428,6 +428,75 @@ impl Twist {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Axis {
+    X,
+    Y,
+    Z,
+}
+impl Axis {
+    pub fn unit(self) -> Vec3 {
+        match self {
+            Axis::X => Vec3::unit_x(),
+            Axis::Y => Vec3::unit_y(),
+            Axis::Z => Vec3::unit_z(),
+        }
+    }
+}
+
+/// a whole-puzzle rotation (every piece rotates): always one of the cube's
+/// 24 axis-aligned orientations, never a 45 deg step — there is no coherent
+/// face-key mapping for a 45 deg rotated puzzle.
+#[derive(Debug, Clone, Copy)]
+pub struct Rotation(Rot);
+impl Rotation {
+    /// `multiplicity` matches `Twist`'s convention (1 is a 45 deg turn), so
+    /// it must always be even.
+    pub fn new(axis: Axis, multiplicity: i8) -> Self {
+        debug_assert!(
+            multiplicity % 2 == 0,
+            "whole-puzzle rotations must be multiples of 90 deg"
+        );
+        let angle = -multiplicity as f32 * std::f32::consts::FRAC_PI_4;
+        Self::from_quat(Rot::from_axis_angle(axis.unit(), cgmath::Rad(angle)))
+    }
+
+    /// canonicalized to the s >= 0 hemisphere (q and -q are the same
+    /// rotation) so `axis_angle` animates the short way (<= 180 deg).
+    pub fn from_quat(rot: Rot) -> Self {
+        // axis-aligned <=> unit axes map to signed unit axes <=> the images
+        // of the rotated axes have L1 norm 1.
+        debug_assert!(
+            [Vec3::unit_x(), Vec3::unit_y()].into_iter().all(|axis| {
+                let v = rot.rotate_vector(axis);
+                (v.x.abs() + v.y.abs() + v.z.abs() - 1.0).abs() < 1e-4
+            }),
+            "not one of the 24 axis-aligned orientations: {rot:?}"
+        );
+        Self(if rot.s < 0.0 { -rot } else { rot })
+    }
+
+    pub fn inv(self) -> Self {
+        // the conjugate of a unit quaternion is its inverse; s is unchanged,
+        // so the result stays canonical.
+        Self(self.0.conjugate())
+    }
+
+    /// the rotation as applied to the whole puzzle.
+    pub fn quat(self) -> Rot {
+        self.0
+    }
+
+    /// rotation axis (unit) and angle in radians, for pacing the animation.
+    pub fn axis_angle(self) -> (Vec3, f32) {
+        let sin_half = self.0.v.magnitude();
+        if sin_half < 1e-9 {
+            return (Vec3::unit_x(), 0.0);
+        }
+        (self.0.v / sin_half, 2.0 * sin_half.atan2(self.0.s))
+    }
+}
+
 #[derive(Debug)]
 pub struct TwistError {
     /// indices into pieces of the pieces straddling the twist's boundary.
@@ -542,6 +611,14 @@ impl PuzzleState {
         }
 
         Ok(())
+    }
+
+    /// rotate the whole puzzle: every piece. unlike `twist`, a rotation
+    /// grips everything and so can't be blocked.
+    pub fn rotate(&mut self, rotation: Rotation) {
+        for piece in &mut self.pieces {
+            piece.rot = rotation.quat() * piece.rot;
+        }
     }
 }
 
@@ -696,5 +773,20 @@ mod tests {
             let twist = twists.choose(&mut rand::rng()).unwrap();
             puzzle.twist(*twist).unwrap();
         }
+    }
+
+    #[test]
+    fn rotation_from_quat_canonicalizes_and_round_trips() {
+        // 270 deg about X lands in the s < 0 hemisphere; canonicalization
+        // flips it so the extracted animation runs 90 deg the short way.
+        let q = Rot::from_axis_angle(Vec3::unit_x(), cgmath::Rad(1.5 * std::f32::consts::PI));
+        assert!(q.s < 0.0);
+        let r = Rotation::from_quat(q);
+        assert!(r.quat().s >= 0.0);
+        assert!(r.quat().abs_diff_eq(&-q, 1e-6));
+
+        let (axis, angle) = r.axis_angle();
+        assert!(angle <= std::f32::consts::PI + 1e-6);
+        assert!(Rot::from_axis_angle(axis, cgmath::Rad(angle)).abs_diff_eq(&r.quat(), 1e-6));
     }
 }
