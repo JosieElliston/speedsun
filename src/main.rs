@@ -6,6 +6,7 @@ mod puzzle_state;
 mod puzzle_view;
 mod render;
 mod simulation;
+mod styles;
 
 fn main() -> Result<(), eframe::Error> {
     // let puzzle = puzzle::MixupCube::new();

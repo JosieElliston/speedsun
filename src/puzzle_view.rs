@@ -5,10 +5,11 @@ use eframe::{egui, egui_wgpu};
 
 use crate::{
     commands::{Command, Origin},
-    filters::{FaceColor, Filters},
+    filters::Filters,
     puzzle_state::*,
     render::{FrameInput, GpuRenderer, Vertex},
     simulation::{PuzzleSimulation, ease},
+    styles::{FaceColor, Styles},
 };
 
 /// opacity of the hovered twist gizmo face.
@@ -434,11 +435,17 @@ impl PuzzleView {
         )
     }
 
-    /// Render the puzzle: read-only against the simulation and filters.
+    /// Render the puzzle: read-only against the simulation, filters, and
+    /// styles.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the main puzzle render is the deliberate many-component reader"
+    )]
     pub fn draw(
         &mut self,
         sim: &PuzzleSimulation,
         filters: &Filters,
+        styles: &Styles,
         hover: &Hover,
         layer: u8,
         painter: &egui::Painter,
@@ -477,7 +484,7 @@ impl PuzzleView {
 
             let hovered = hover.piece == Some(piece_idx);
             let selected = self.selected_pieces.contains(&piece_idx);
-            let style = filters.style_of_state(piece, hovered, selected);
+            let style = filters.style_of_state(styles, piece, hovered, selected);
             let face_a = style.face_opacity.clamp(0.0, 1.0);
             let outline_a = style.outline_opacity.clamp(0.0, 1.0);
             let outline_w = self.outline_width * style.outline_size;

@@ -31,6 +31,7 @@
 - chromebook support??
 - finish animation is the cube exploding/popping
 - the meet of two blocks is their intersection, the join of two blocks is the smallest block that contains both of them, two blocks are mergeable if their join equals their disjoint union
+- probably Action and Move shouldn't both exist
 
 ## commands / components
 

@@ -9,6 +9,7 @@ use crate::{
     puzzle_state::*,
     puzzle_view::*,
     simulation::PuzzleSimulation,
+    styles::StyleEditor,
 };
 
 /// Which subsystem's UI the sidebar shows (HSC2-style, minus the icons).
@@ -17,15 +18,17 @@ enum SidebarTab {
     Twists,
     View,
     Filters,
+    Styles,
 }
 impl SidebarTab {
-    const ALL: [Self; 3] = [Self::Twists, Self::View, Self::Filters];
+    const ALL: [Self; 4] = [Self::Twists, Self::View, Self::Filters, Self::Styles];
 
     fn name(self) -> &'static str {
         match self {
             Self::Twists => "Twists",
             Self::View => "View",
             Self::Filters => "Filters",
+            Self::Styles => "Styles",
         }
     }
 }
@@ -40,6 +43,7 @@ pub struct App {
     keybinds: Keybinds,
     layer: u8,
     filters: Filters,
+    style_editor: StyleEditor,
     sidebar_tab: SidebarTab,
     queue: VecDeque<Command>,
 }
@@ -49,12 +53,17 @@ impl App {
             .wgpu_render_state
             .clone()
             .expect("main requests the wgpu renderer");
+        // filters hold `Rc` handles into the style set, so the styles
+        // component exists first.
+        let style_editor = StyleEditor::default();
+        let filters = Filters::new(&style_editor.styles);
         Self {
             sim: PuzzleSimulation::new(PuzzleState::new()),
             puzzle_view: PuzzleView::new(render_state),
             keybinds: Keybinds,
             layer: 0,
-            filters: Filters::default(),
+            filters,
+            style_editor,
             sidebar_tab: SidebarTab::Twists,
             queue: VecDeque::new(),
         }
@@ -131,7 +140,8 @@ impl eframe::App for App {
             egui::ScrollArea::vertical().show(ui, |ui| match self.sidebar_tab {
                 SidebarTab::Twists => self.twists_ui(ui),
                 SidebarTab::View => self.puzzle_view.ui(ui),
-                SidebarTab::Filters => self.filters.ui(ui),
+                SidebarTab::Filters => self.filters.ui(ui, &self.style_editor.styles),
+                SidebarTab::Styles => self.style_editor.ui(ui),
             });
         });
 
@@ -168,6 +178,7 @@ impl eframe::App for App {
             self.puzzle_view.draw(
                 &self.sim,
                 &self.filters,
+                &self.style_editor.styles,
                 &hover,
                 self.layer,
                 &ui.painter_at(rect),
