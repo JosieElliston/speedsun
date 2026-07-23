@@ -1,3 +1,5 @@
+use std::fmt;
+
 use cgmath::{InnerSpace, Rotation as _, Rotation3};
 use eframe::egui;
 
@@ -31,6 +33,20 @@ impl Side {
             Side::D => egui::Color32::from_rgb(255, 255, 0),
             Side::F => egui::Color32::from_rgb(0, 255, 0),
             Side::B => egui::Color32::from_rgb(0, 0, 255),
+        }
+    }
+
+    /// the coordinate axis the side lies on, and its sign along it. lets a
+    /// grip stand in for an axis, so a reorientation can be named by the side
+    /// it turns like (`U` turns the puzzle the way a `U` twist turns its layer).
+    pub fn axis(self) -> (Axis, i8) {
+        match self {
+            Side::R => (Axis::X, 1),
+            Side::L => (Axis::X, -1),
+            Side::U => (Axis::Y, 1),
+            Side::D => (Axis::Y, -1),
+            Side::F => (Axis::Z, 1),
+            Side::B => (Axis::Z, -1),
         }
     }
 
@@ -405,14 +421,57 @@ impl Piece {
     }
 }
 
+/// which layers a twist grips, as a bitmask: bit `i` is layer `i`, counted
+/// from the twisted side (0 is the layer touching the side, 1 the middle, 2
+/// the far layer). the empty mask grips nothing; the full mask grips every
+/// piece, so it can never be blocked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LayerMask(pub u8);
+impl LayerMask {
+    /// every speedsun puzzle so far has three layers.
+    pub const N_LAYERS: u8 = 3;
+    pub const NONE: Self = Self(0);
+    /// just the layer touching the side: an ordinary face twist.
+    pub const OUTER: Self = Self(0b001);
+
+    pub const fn layer(layer: u8) -> Self {
+        Self(1 << layer)
+    }
+
+    pub fn contains(self, layer: u8) -> bool {
+        self.0 & Self::layer(layer).0 != 0
+    }
+
+    pub fn set(&mut self, layer: u8, present: bool) {
+        if present {
+            self.0 |= Self::layer(layer).0;
+        } else {
+            self.0 &= !Self::layer(layer).0;
+        }
+    }
+}
+impl fmt::Display for LayerMask {
+    /// the same syntax keybind expressions use, e.g. `{0,1}`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{{")?;
+        let mut first = true;
+        for layer in 0..Self::N_LAYERS {
+            if self.contains(layer) {
+                if !first {
+                    write!(f, ",")?;
+                }
+                write!(f, "{layer}")?;
+                first = false;
+            }
+        }
+        write!(f, "}}")
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct Twist {
     pub side: Side,
-    /// 0, 1, 2
-    /// 0 is the layer closest to the side,
-    /// 1 is the middle layer,
-    /// and 2 is the layer farthest from the side.
-    pub layer: u8,
+    pub layers: LayerMask,
     /// note that 1 is a 45 deg turn,
     /// 2 is a quarter turn,
     /// and 4 is a half turn.
@@ -422,7 +481,7 @@ impl Twist {
     pub fn inv(&self) -> Self {
         Self {
             side: self.side,
-            layer: self.layer,
+            layers: self.layers,
             multiplicity: -self.multiplicity,
         }
     }
@@ -539,7 +598,7 @@ impl PuzzleState {
 
         let twists = Side::POS.map(|side| Twist {
             side,
-            layer: 1,
+            layers: LayerMask::layer(1),
             multiplicity: 1,
         });
 
@@ -567,31 +626,39 @@ impl PuzzleState {
 
     /// which pieces a twist would rotate, without mutating.
     /// used by the view to animate a twist before applying it.
+    ///
+    /// a piece rotates when every layer it occupies is in the mask, and blocks
+    /// the twist when it occupies both a masked and an unmasked layer — a
+    /// fudged piece spanning two layers is exactly the piece that bandages
+    /// them together.
     pub fn twist_pieces(&self, twist: Twist) -> Result<Vec<usize>, TwistError> {
         let mut blocked = Vec::new();
         let mut inside = Vec::new();
 
         let plane_norm = twist.side.plane();
-        let (length_lo, length_hi) = match twist.layer {
-            0 => (Self::CUT_DEPTH, f32::INFINITY),
-            1 => (-Self::CUT_DEPTH, Self::CUT_DEPTH),
-            2 => (f32::NEG_INFINITY, -Self::CUT_DEPTH),
-            _ => panic!("invalid layer"),
-        };
-
         for (piece_idx, piece) in self.pieces.iter().enumerate() {
-            let lo = piece.is_split_by(plane_norm, length_lo);
-            let hi = piece.is_split_by(plane_norm, length_hi);
-            match (lo, hi) {
-                (IsSplitResult::Inside, IsSplitResult::Inside) => (),
-                (IsSplitResult::Inside, IsSplitResult::Outside) => inside.push(piece_idx),
-                (IsSplitResult::Inside, IsSplitResult::Both) => blocked.push(piece_idx),
-                (IsSplitResult::Outside, IsSplitResult::Inside) => unreachable!(),
-                (IsSplitResult::Outside, IsSplitResult::Outside) => (),
-                (IsSplitResult::Outside, IsSplitResult::Both) => unreachable!(),
-                (IsSplitResult::Both, IsSplitResult::Inside) => unreachable!(),
-                (IsSplitResult::Both, IsSplitResult::Outside) => blocked.push(piece_idx),
-                (IsSplitResult::Both, IsSplitResult::Both) => blocked.push(piece_idx),
+            // the two cut planes, at +/- the cut depth along the side's normal.
+            // `Inside` means the piece is entirely on the side's own side of
+            // that plane.
+            let hi = piece.is_split_by(plane_norm, Self::CUT_DEPTH);
+            let lo = piece.is_split_by(plane_norm, -Self::CUT_DEPTH);
+            let occupied = match (hi, lo) {
+                (IsSplitResult::Inside, IsSplitResult::Inside) => LayerMask(0b001),
+                (IsSplitResult::Outside, IsSplitResult::Inside) => LayerMask(0b010),
+                (IsSplitResult::Outside, IsSplitResult::Outside) => LayerMask(0b100),
+                (IsSplitResult::Outside, IsSplitResult::Both) => LayerMask(0b110),
+                (IsSplitResult::Both, IsSplitResult::Inside) => LayerMask(0b011),
+                (IsSplitResult::Both, IsSplitResult::Both) => LayerMask(0b111),
+                // a piece beyond the outer cut is beyond the inner one too, and
+                // one straddling the outer cut can't also be past the inner one.
+                (IsSplitResult::Inside, _) | (IsSplitResult::Both, IsSplitResult::Outside) => {
+                    unreachable!()
+                }
+            };
+            match twist.layers.0 & occupied.0 {
+                0 => (),
+                gripped if gripped == occupied.0 => inside.push(piece_idx),
+                _ => blocked.push(piece_idx),
             }
         }
 
@@ -664,7 +731,7 @@ mod tests {
         cube.unbandage();
         let m = Twist {
             side: Side::L,
-            layer: 1,
+            layers: LayerMask::layer(1),
             multiplicity: 1,
         };
         cube.twist(m).unwrap();
@@ -711,13 +778,13 @@ mod tests {
         let twists: [Twist; 9] = Side::ALL
             .map(|side| Twist {
                 side,
-                layer: 0,
+                layers: LayerMask::OUTER,
                 multiplicity: 2,
             })
             .into_iter()
             .chain(Side::POS.map(|side| Twist {
                 side,
-                layer: 1,
+                layers: LayerMask::layer(1),
                 multiplicity: 1,
             }))
             .collect_array()
@@ -755,13 +822,13 @@ mod tests {
         let twists: [Twist; 9] = Side::ALL
             .map(|side| Twist {
                 side,
-                layer: 0,
+                layers: LayerMask::OUTER,
                 multiplicity: 2,
             })
             .into_iter()
             .chain(Side::POS.map(|side| Twist {
                 side,
-                layer: 1,
+                layers: LayerMask::layer(1),
                 multiplicity: 1,
             }))
             .collect_array()

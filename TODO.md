@@ -32,6 +32,7 @@
 - finish animation is the cube exploding/popping
 - the meet of two blocks is their intersection, the join of two blocks is the smallest block that contains both of them, two blocks are mergeable if their join equals their disjoint union
 - probably Action and Move shouldn't both exist
+- remove outline width from view settings
 
 ## commands / components
 
@@ -106,3 +107,5 @@
 - note mousebinds are part of keybinds,
 - keybinds have access to optional hovered_grip_gizmo
 mouse and key events are commands,
+- keyboard layouts other than qwerty
+- mac/not mac cmd/ctrl

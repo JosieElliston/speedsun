@@ -4,7 +4,7 @@ use cgmath::{InnerSpace, Rotation, Rotation3};
 use eframe::{egui, egui_wgpu};
 
 use crate::{
-    commands::{Command, Origin},
+    commands::Command,
     filters::Filters,
     puzzle_state::*,
     render::{FrameInput, GpuRenderer, Vertex},
@@ -188,6 +188,17 @@ impl PuzzleView {
         a
     }
 
+    /// the hovered twist gizmo as the keybind system sees it: the grip, and
+    /// whether clicking it should twist the other way (it's a backface and
+    /// this view reverses backface twists — a view preference, so it's folded
+    /// in here rather than exposed as a variable).
+    pub fn hovered_grip(&self, hover: &Hover) -> (Option<Side>, bool) {
+        match hover.gizmo {
+            Some((side, front)) => (Some(side), !front && self.reverse_backface_twists),
+            None => (None, false),
+        }
+    }
+
     pub fn toggle_selection(&mut self, piece_idx: usize) {
         if !self.selected_pieces.remove(&piece_idx) {
             self.selected_pieces.insert(piece_idx);
@@ -296,15 +307,16 @@ impl PuzzleView {
         (w, h, sx, sy)
     }
 
-    /// Interpret pointer input: gizmo hover/clicks (twist input) and
-    /// shift-hover/clicks (piece picking and selection). Emits commands
+    /// Interpret pointer input: what the pointer is over (gizmo, or piece
+    /// while shift is held) and shift-clicks for selection. Emits commands
     /// instead of mutating; the returned `Hover` feeds `draw` and the
-    /// keybinds' input context. Also advances the camera snap animation.
+    /// keybinds' input context — twisting by mouse is a keybind on
+    /// `hovered_grip`, not something the view does itself. Also advances the
+    /// camera snap animation.
     pub fn interact(
         &mut self,
         sim: &PuzzleSimulation,
         response: &egui::Response,
-        layer: u8,
         now: Instant,
     ) -> (Vec<Command>, Hover) {
         self.tick_camera(now);
@@ -342,39 +354,6 @@ impl PuzzleView {
                 self.gizmo_hit(xv, yv)
             })
         };
-        // The hub routes these to the simulation before its tick, so the
-        // twist still starts on the frame of the press.
-        if let Some((side, front)) = gizmo_hover {
-            // twist on mouse down (not click) for a snappier feel; dragging the
-            // background still rotates the view. left: CCW (like the `'`
-            // buttons); right: CW.
-            let (primary, secondary) = ctx.input(|i| {
-                (
-                    i.pointer.button_pressed(egui::PointerButton::Primary),
-                    i.pointer.button_pressed(egui::PointerButton::Secondary),
-                )
-            });
-            let multiplicity = if primary {
-                Some(-1)
-            } else if secondary {
-                Some(1)
-            } else {
-                None
-            };
-            if let Some(mut multiplicity) = multiplicity {
-                if !front && self.reverse_backface_twists {
-                    multiplicity = -multiplicity;
-                }
-                commands.push(Command::Twist {
-                    twist: Twist {
-                        side,
-                        layer,
-                        multiplicity,
-                    },
-                    origin: Origin::User,
-                });
-            }
-        }
 
         // with shift held, pick the piece under the pointer (nearest clip-space
         // depth among the sticker triangles containing it), so its hovered
@@ -448,7 +427,7 @@ impl PuzzleView {
         filters: &Filters,
         styles: &Styles,
         hover: &Hover,
-        layer: u8,
+        layers: LayerMask,
         painter: &egui::Painter,
         now: Instant,
     ) {
@@ -579,7 +558,7 @@ impl PuzzleView {
                 .puzzle()
                 .twist_pieces(Twist {
                     side,
-                    layer,
+                    layers,
                     multiplicity: 1,
                 })
                 .is_err();

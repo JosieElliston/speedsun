@@ -1,5 +1,6 @@
 mod app;
 mod commands;
+mod expr;
 mod filters;
 mod keybinds;
 mod puzzle_state;

@@ -5,7 +5,7 @@ use eframe::egui;
 use crate::{
     commands::{Command, Origin},
     filters::Filters,
-    keybinds::{InputContext, Keybinds},
+    keybinds::{self, InputContext, Keybinds},
     puzzle_state::*,
     puzzle_view::*,
     simulation::PuzzleSimulation,
@@ -19,9 +19,16 @@ enum SidebarTab {
     View,
     Filters,
     Styles,
+    Keybinds,
 }
 impl SidebarTab {
-    const ALL: [Self; 4] = [Self::Twists, Self::View, Self::Filters, Self::Styles];
+    const ALL: [Self; 5] = [
+        Self::Twists,
+        Self::View,
+        Self::Filters,
+        Self::Styles,
+        Self::Keybinds,
+    ];
 
     fn name(self) -> &'static str {
         match self {
@@ -29,6 +36,7 @@ impl SidebarTab {
             Self::View => "View",
             Self::Filters => "Filters",
             Self::Styles => "Styles",
+            Self::Keybinds => "Keybinds",
         }
     }
 }
@@ -41,7 +49,6 @@ pub struct App {
     sim: PuzzleSimulation,
     puzzle_view: PuzzleView,
     keybinds: Keybinds,
-    layer: u8,
     filters: Filters,
     style_editor: StyleEditor,
     sidebar_tab: SidebarTab,
@@ -60,8 +67,7 @@ impl App {
         Self {
             sim: PuzzleSimulation::new(PuzzleState::new()),
             puzzle_view: PuzzleView::new(render_state),
-            keybinds: Keybinds,
-            layer: 0,
+            keybinds: Keybinds::default(),
             filters,
             style_editor,
             sidebar_tab: SidebarTab::Twists,
@@ -69,9 +75,20 @@ impl App {
         }
     }
 
-    /// twist-input sidebar tab: layer slider + a button per face twist.
+    /// twist-input sidebar tab: the layer mask + a button per face twist. the
+    /// mask is the `default_mask` keybind variable, so these buttons twist
+    /// exactly what the keys and the mouse twist.
     fn twists_ui(&mut self, ui: &mut egui::Ui) {
-        ui.add(egui::Slider::new(&mut self.layer, 0..=2).text("layer"));
+        ui.horizontal(|ui| {
+            ui.label("default_mask");
+            match self.keybinds.var_mut("default_mask") {
+                Some(value) => keybinds::ui_value(ui, value),
+                None => {
+                    ui.weak("(no such variable)");
+                }
+            }
+        });
+        let layers = self.keybinds.default_mask();
         for side in Side::ALL {
             ui.horizontal(|ui| {
                 for multiplicity in [-1, 1] {
@@ -84,7 +101,7 @@ impl App {
                         self.queue.push_back(Command::Twist {
                             twist: Twist {
                                 side,
-                                layer: self.layer,
+                                layers,
                                 multiplicity,
                             },
                             origin: Origin::User,
@@ -143,8 +160,17 @@ impl eframe::App for App {
                 SidebarTab::View => self.puzzle_view.ui(ui),
                 SidebarTab::Filters => self.filters.ui(ui, &self.style_editor.styles),
                 SidebarTab::Styles => self.style_editor.ui(ui),
+                SidebarTab::Keybinds => self.keybinds.ui(ui),
             });
         });
+
+        // the pinned keybind variables. only there once something is pinned,
+        // so an unused bar doesn't eat a strip of the window.
+        if self.keybinds.has_pinned() {
+            egui::Panel::bottom("pinned_variables").show(ui, |ui| {
+                self.keybinds.pinned_ui(ui);
+            });
+        }
 
         egui::CentralPanel::default().show(ui, |ui| {
             let (rect, response) =
@@ -158,14 +184,14 @@ impl eframe::App for App {
             }
 
             // gather commands: pointer input first (its hover feeds the
-            // keybind context), then keys.
-            let (commands, hover) = self
-                .puzzle_view
-                .interact(&self.sim, &response, self.layer, now);
+            // keybind context), then the keybind pass, which is where both the
+            // keyboard and the mouse turn into twists.
+            let (commands, hover) = self.puzzle_view.interact(&self.sim, &response, now);
             self.queue.extend(commands);
+            let (hovered_grip, hovered_grip_inverted) = self.puzzle_view.hovered_grip(&hover);
             let input_context = InputContext {
-                layer: self.layer,
-                hovered_gizmo: hover.gizmo,
+                hovered_grip,
+                hovered_grip_inverted,
             };
             self.queue
                 .extend(self.keybinds.collect(ui.ctx(), &input_context));
@@ -181,7 +207,7 @@ impl eframe::App for App {
                 &self.filters,
                 &self.style_editor.styles,
                 &hover,
-                self.layer,
+                self.keybinds.default_mask(),
                 &ui.painter_at(rect),
                 now,
             );
