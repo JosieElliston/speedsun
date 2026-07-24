@@ -36,87 +36,81 @@ pub struct InputContext {
     pub hovered_grip_inverted: bool,
 }
 
-/// Every input the builtin variables read, sampled once per pass so a binding
-/// can't see the state change halfway through, and kept until the next pass to
-/// find rising edges.
+/// The persistent input state every builtin variable reads from. Both physical
+/// events and reference clicks mutate it, so there is one source of truth for
+/// "is this down" — a physical release event clears exactly the bit a click
+/// set, and no separate clicked overlay has to be reconciled with the keyboard.
+///
+/// A clone taken at the end of each pass ([`Keybinds::prev_input`]) is what
+/// rising edges are found against.
 #[derive(Default, Clone)]
-struct InputSnapshot {
+struct InputState {
+    /// keys held down. press events add, release events remove, a reference
+    /// click toggles.
     keys: HashSet<egui::Key>,
-    /// keys that got a press event this pass. a press is an edge even if the
-    /// key already looked down: macOS drops key-up events while cmd is held,
-    /// which would otherwise leave the key stuck and swallow the next press.
+    /// keys that got a press event this pass, cleared each pass, so a key
+    /// counts as down for the frame it was pressed even if the release already
+    /// arrived — at speedsolving speed a tap can fit between two frames, and it
+    /// mustn't be dropped. It's a real false -> true across the frame boundary,
+    /// not an override of the edge rule.
     pressed: HashSet<egui::Key>,
-    modifiers: egui::Modifiers,
-    /// left, right, middle.
+    /// left, right, middle, held down.
     mouse: [bool; 3],
+    /// mouse buttons pressed this pass, cleared each pass; the same
+    /// within-a-frame reasoning as `pressed`.
+    mouse_pressed: [bool; 3],
+    modifiers: egui::Modifiers,
     hovered_grip: Option<Side>,
     hovered_grip_inverted: bool,
-    /// variables the keybind reference has clicked into a state of their own.
-    /// part of the snapshot, not read live, so clicking one is a rising edge
-    /// like any other press.
-    overrides: HashMap<String, bool>,
 }
-impl InputSnapshot {
-    fn capture(ctx: &egui::Context, input: &InputContext) -> Self {
-        // while a text field has focus, every key reads as up: typing must
-        // never fire a binding, and a key held across the focus change ends
-        // its press instead of firing on the way out.
-        let typing = ctx.egui_wants_keyboard_input();
-        ctx.input(|i| {
-            let pressed: HashSet<egui::Key> = if typing {
-                HashSet::new()
-            } else {
-                i.events
-                    .iter()
-                    .filter_map(|event| match event {
-                        egui::Event::Key {
-                            key,
-                            pressed: true,
-                            // auto-repeat isn't a new press.
-                            repeat: false,
-                            ..
-                        } => Some(*key),
-                        _ => None,
-                    })
-                    .collect()
-            };
-            Self {
-                // a key pressed and released inside one frame is still down
-                // for that frame: at speedsolving speed a tap can fit between
-                // two frames, and dropping it would drop the twist.
-                keys: if typing {
-                    HashSet::new()
-                } else {
-                    i.keys_down.union(&pressed).copied().collect()
-                },
-                pressed,
-                modifiers: if typing {
-                    egui::Modifiers::NONE
-                } else {
-                    i.modifiers
-                },
-                mouse: [
-                    egui::PointerButton::Primary,
-                    egui::PointerButton::Secondary,
-                    egui::PointerButton::Middle,
-                ]
-                // same for a click too short to span a frame.
-                .map(|button| i.pointer.button_down(button) || i.pointer.button_pressed(button)),
-                hovered_grip: input.hovered_grip,
-                hovered_grip_inverted: input.hovered_grip_inverted,
-                // filled in by `collect`, once it knows which overrides the
-                // real input has taken back.
-                overrides: HashMap::new(),
-            }
-        })
+impl InputState {
+    /// a key went down: held, and marked pressed-this-pass so it's an edge.
+    fn press(&mut self, key: egui::Key) {
+        self.keys.insert(key);
+        self.pressed.insert(key);
     }
 
-    /// did this variable get a fresh press event this pass? only keys have
-    /// one; see `pressed`.
-    fn repressed(&self, name: &str) -> bool {
-        name.strip_prefix("key_")
-            .and_then(key_by_name)
-            .is_some_and(|key| self.pressed.contains(&key))
+    /// a key went up.
+    fn release(&mut self, key: egui::Key) {
+        self.keys.remove(&key);
+    }
+
+    /// a mouse button went down, held and marked pressed-this-pass.
+    fn mouse_press(&mut self, idx: usize) {
+        self.mouse[idx] = true;
+        self.mouse_pressed[idx] = true;
+    }
+}
+
+/// the three mouse buttons the builtins expose, in `mouse` order.
+fn mouse_index(button: egui::PointerButton) -> Option<usize> {
+    match button {
+        egui::PointerButton::Primary => Some(0),
+        egui::PointerButton::Secondary => Some(1),
+        egui::PointerButton::Middle => Some(2),
+        _ => None,
+    }
+}
+
+/// Fold physical modifier *changes* into the persistent state. Only a flag that
+/// actually moved is written, so a reference-toggled modifier survives frames
+/// where the physical key didn't move, while a real release still clears it —
+/// the same hand-back a key gets, against egui's authoritative `modifiers`.
+fn apply_modifier_delta(current: &mut egui::Modifiers, was: egui::Modifiers, now: egui::Modifiers) {
+    if now.shift != was.shift {
+        current.shift = now.shift;
+    }
+    if now.ctrl != was.ctrl {
+        current.ctrl = now.ctrl;
+    }
+    if now.alt != was.alt {
+        current.alt = now.alt;
+    }
+    if now.mac_cmd != was.mac_cmd {
+        current.mac_cmd = now.mac_cmd;
+    }
+    if now.command != was.command {
+        current.command = now.command;
     }
 }
 
@@ -138,34 +132,30 @@ const BUILTINS: &[(&str, Type)] = &[
     ("key_command", Type::Bool),
 ];
 
-/// `key_shift` and friends are egui's modifier *state*, which doesn't say
-/// which side was pressed; the individual modifier keys are ordinary keys, so
-/// `key_shiftleft` and `key_shiftright` work too. `key_command` is cmd on
-/// macOS and ctrl elsewhere, matching every other app on the platform.
-fn builtin(name: &str, input: &InputSnapshot) -> Option<Value> {
-    // a variable the reference has clicked reads as it clicked it, until the
-    // real input catches up (see `collect`).
-    if let Some(&overridden) = input.overrides.get(name) {
-        return Some(Value::Bool(overridden));
-    }
-    physical(name, input)
-}
-
-/// what the keyboard and mouse actually say, ignoring the reference.
-fn physical(name: &str, input: &InputSnapshot) -> Option<Value> {
+/// The value of a builtin variable, read straight from the persistent input.
+/// Reference clicks and the keyboard both write to that state, so there is no
+/// overlay to consult first.
+///
+/// `key_shift` and friends are egui's modifier *state*, which doesn't say which
+/// side was pressed; the individual modifier keys are ordinary keys, so
+/// `key_shiftleft` and `key_shiftright` work too. `key_command` is cmd on macOS
+/// and ctrl elsewhere, matching every other app on the platform.
+fn read(name: &str, input: &InputState) -> Option<Value> {
     Some(match name {
         "hovered_grip" => Value::Grip(input.hovered_grip),
         "hovered_grip_inverted" => Value::Bool(input.hovered_grip_inverted),
-        "mouse_left" => Value::Bool(input.mouse[0]),
-        "mouse_right" => Value::Bool(input.mouse[1]),
-        "mouse_middle" => Value::Bool(input.mouse[2]),
+        "mouse_left" => Value::Bool(input.mouse[0] || input.mouse_pressed[0]),
+        "mouse_right" => Value::Bool(input.mouse[1] || input.mouse_pressed[1]),
+        "mouse_middle" => Value::Bool(input.mouse[2] || input.mouse_pressed[2]),
         "key_shift" => Value::Bool(input.modifiers.shift),
         "key_ctrl" => Value::Bool(input.modifiers.ctrl),
         "key_alt" => Value::Bool(input.modifiers.alt),
         "key_command" => Value::Bool(input.modifiers.command),
         _ => {
             let key = key_by_name(name.strip_prefix("key_")?)?;
-            Value::Bool(input.keys.contains(&key))
+            // pressed as well as held: a key tapped inside one frame is down
+            // for that frame even though the release already cleared it.
+            Value::Bool(input.keys.contains(&key) || input.pressed.contains(&key))
         }
     })
 }
@@ -216,11 +206,11 @@ pub struct UserVar {
 /// Variable lookup for one pass: builtins shadow user variables, so builtin
 /// names are effectively reserved.
 ///
-/// The two overrides are what makes a preview possible — asking "what would
+/// The two forced fields are what make a preview possible — asking "what would
 /// happen if this were pressed" is the same pass with one variable answered
 /// differently, so nothing has to be mutated and put back.
 struct Vars<'a> {
-    input: &'a InputSnapshot,
+    input: &'a InputState,
     user: UserVars<'a>,
     /// this variable reads as this value, whatever the input says.
     forced: Option<(&'a str, bool)>,
@@ -228,7 +218,7 @@ struct Vars<'a> {
     hovered_grip: Option<Side>,
 }
 impl<'a> Vars<'a> {
-    fn new(input: &'a InputSnapshot, user: UserVars<'a>) -> Self {
+    fn new(input: &'a InputState, user: UserVars<'a>) -> Self {
         Self {
             input,
             user,
@@ -267,7 +257,7 @@ impl expr::Env for Vars<'_> {
         if self.hovered_grip.is_some() && name == "hovered_grip" {
             return Some(Value::Grip(self.hovered_grip));
         }
-        builtin(name, self.input).or_else(|| self.user.get(name))
+        read(name, self.input).or_else(|| self.user.get(name))
     }
 }
 
@@ -610,12 +600,15 @@ impl<'a> Pass<'a> {
         if let Some((forced, _)) = self.env.forced {
             return Ok(forced == trigger);
         }
+        // a rising edge is purely the variable going false -> true. a press
+        // while it's already true (held, or clicked down in the reference) is
+        // not an edge, whatever the physical key did.
         // a variable that didn't exist last pass counts as not-true.
         let was = self
             .prev
             .get(trigger)
             .is_some_and(|v| v == Value::Bool(true));
-        Ok(!was || self.env.input.repressed(trigger))
+        Ok(!was)
     }
 }
 
@@ -624,12 +617,16 @@ impl<'a> Pass<'a> {
 pub struct Keybinds {
     vars: Vec<UserVar>,
     root: Vec<Node>,
+    /// the persistent input: keys, mouse, and modifiers held down, written by
+    /// both the keyboard and the reference. read live by guards and arguments.
+    input: InputState,
     /// last pass's input and variable values, for finding rising edges. also
     /// what previews are evaluated against.
-    prev_input: InputSnapshot,
+    prev_input: InputState,
     prev_vars: HashMap<String, Value>,
-    /// variables the reference has clicked; see `InputSnapshot::overrides`.
-    overrides: HashMap<String, bool>,
+    /// last frame's physical modifier state, so only real modifier *changes*
+    /// are folded into `input` (leaving reference toggles alone).
+    physical_modifiers: egui::Modifiers,
     /// the last *non-empty* resolution set: a pass that fired nothing would
     /// wipe the display a frame after the twist it explains.
     last_fired: Vec<Fired>,
@@ -712,27 +709,85 @@ impl Default for Keybinds {
                     ],
                 ),
             ],
-            prev_input: InputSnapshot::default(),
+            input: InputState::default(),
+            prev_input: InputState::default(),
             prev_vars: HashMap::new(),
-            overrides: HashMap::new(),
+            physical_modifiers: egui::Modifiers::default(),
             last_fired: Vec::new(),
             errors: Vec::new(),
         }
     }
 }
 impl Keybinds {
-    /// One pass: sample the input, walk the tree, and execute the resolution
-    /// set. Only the first command executes for now, which also enforces the
-    /// speedsolving rule of at most one twist per pass.
+    /// One pass: fold this frame's input into the persistent state, walk the
+    /// tree, and execute the resolution set. Only the first command executes
+    /// for now, which also enforces the speedsolving rule of at most one twist
+    /// per pass.
     pub fn collect(&mut self, ctx: &egui::Context, input: &InputContext) -> Vec<Command> {
-        let mut now_input = InputSnapshot::capture(ctx, input);
-        // A click on the reference holds a key until the real input agrees
-        // with it: press a key you clicked down and the keyboard takes it
-        // back, so it releases when you let go rather than staying stuck.
-        self.overrides
-            .retain(|name, &mut clicked| physical(name, &now_input) != Some(Value::Bool(clicked)));
-        now_input.overrides = self.overrides.clone();
+        self.apply_input(ctx, input);
+        self.run_pass()
+    }
 
+    /// Fold this frame's physical input into the persistent state. Keys and
+    /// mouse buttons come from events, so a bit a reference click set isn't
+    /// clobbered by re-sampling; modifiers come from the change in egui's
+    /// authoritative state (see [`apply_modifier_delta`]).
+    fn apply_input(&mut self, ctx: &egui::Context, context: &InputContext) {
+        self.input.pressed.clear();
+        self.input.mouse_pressed = [false; 3];
+        self.input.hovered_grip = context.hovered_grip;
+        self.input.hovered_grip_inverted = context.hovered_grip_inverted;
+
+        // `egui_wants_keyboard_input` reads the input lock itself, so sample it
+        // before taking that lock below.
+        let typing = ctx.egui_wants_keyboard_input();
+        ctx.input(|i| {
+            // while a text field has focus, or the window is in the background,
+            // everything reads as up: typing must never fire a binding, and
+            // nothing stays stuck after a release the window never saw.
+            if typing || !i.focused {
+                self.input.keys.clear();
+                self.input.mouse = [false; 3];
+                self.input.modifiers = egui::Modifiers::default();
+                self.physical_modifiers = i.modifiers;
+                return;
+            }
+            for event in &i.events {
+                match event {
+                    egui::Event::Key {
+                        key,
+                        pressed: true,
+                        // auto-repeat isn't a new press.
+                        repeat: false,
+                        ..
+                    } => self.input.press(*key),
+                    egui::Event::Key {
+                        key,
+                        pressed: false,
+                        ..
+                    } => self.input.release(*key),
+                    egui::Event::PointerButton {
+                        button, pressed, ..
+                    } => {
+                        if let Some(idx) = mouse_index(*button) {
+                            if *pressed {
+                                self.input.mouse_press(idx);
+                            } else {
+                                self.input.mouse[idx] = false;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            apply_modifier_delta(&mut self.input.modifiers, self.physical_modifiers, i.modifiers);
+            self.physical_modifiers = i.modifiers;
+        });
+    }
+
+    /// Walk the tree against the current persistent input, execute the first
+    /// fired command, and roll the state forward so next pass can find edges.
+    fn run_pass(&mut self) -> Vec<Command> {
         let now_vars: HashMap<String, Value> = self
             .vars
             .iter()
@@ -740,7 +795,7 @@ impl Keybinds {
             .collect();
 
         let (fired, mut errors) = self.resolve(
-            Vars::new(&now_input, UserVars::Live(&self.vars)),
+            Vars::new(&self.input, UserVars::Live(&self.vars)),
             Vars::new(&self.prev_input, UserVars::Snapshot(&self.prev_vars)),
         );
 
@@ -759,7 +814,7 @@ impl Keybinds {
 
         // the pre-execution values: a variable a binding just set reads as a
         // rising edge next pass, so bindings can chain.
-        self.prev_input = now_input;
+        self.prev_input = self.input.clone();
         self.prev_vars = now_vars;
         if !fired.is_empty() {
             self.last_fired = fired;
@@ -825,22 +880,43 @@ impl Keybinds {
     }
 
     /// Is this variable down — clicked down in the reference or pressed for
-    /// real? There's one state, and bindings can't tell the difference. A
-    /// click is answered immediately; the keyboard is as of the last pass,
-    /// which is the freshest anything can be.
+    /// real? There's one state, and bindings can't tell the difference. Read
+    /// from the live persistent input, so a click made this frame (the
+    /// reference draws before the pass runs) is answered immediately.
     pub fn is_down(&self, variable: &str) -> bool {
-        if let Some(&clicked) = self.overrides.get(variable) {
-            return clicked;
-        }
-        physical(variable, &self.prev_input) == Some(Value::Bool(true))
+        read(variable, &self.input) == Some(Value::Bool(true))
     }
 
     /// Toggle a variable from the reference: a key that's down goes up and
-    /// vice versa, however it got that way. A press it makes is a real press —
-    /// the next pass sees the rising edge and the binding fires.
+    /// vice versa, however it got that way. The next pass sees the rising edge
+    /// and the binding fires, and a later physical release clears the same bit.
     pub fn toggle(&mut self, variable: &str) {
         let down = self.is_down(variable);
-        self.overrides.insert(variable.to_string(), !down);
+        self.set_down(variable, !down);
+    }
+
+    /// Write a builtin bool into the persistent input. Keys, mouse buttons, and
+    /// modifiers all live there, so a reference click and a keypress land in
+    /// the same place. Names that aren't a toggleable builtin are ignored.
+    fn set_down(&mut self, variable: &str, down: bool) {
+        match variable {
+            "mouse_left" => self.input.mouse[0] = down,
+            "mouse_right" => self.input.mouse[1] = down,
+            "mouse_middle" => self.input.mouse[2] = down,
+            "key_shift" => self.input.modifiers.shift = down,
+            "key_ctrl" => self.input.modifiers.ctrl = down,
+            "key_alt" => self.input.modifiers.alt = down,
+            "key_command" => self.input.modifiers.command = down,
+            _ => {
+                if let Some(key) = variable.strip_prefix("key_").and_then(key_by_name) {
+                    if down {
+                        self.input.keys.insert(key);
+                    } else {
+                        self.input.keys.remove(&key);
+                    }
+                }
+            }
+        }
     }
 
     /// variables are typed, so a set that doesn't match is a mistake worth
@@ -992,7 +1068,7 @@ impl Keybinds {
                 // one pass stale: the sidebar is drawn before the pass that
                 // samples the input.
                 for (name, _) in BUILTINS {
-                    let value = builtin(name, &self.prev_input)
+                    let value = read(name, &self.prev_input)
                         .map_or_else(|| "?".to_string(), |value| value.to_string());
                     ui.label(format!("{name} = {value}"));
                 }
@@ -1282,43 +1358,15 @@ fn ui_binding(ui: &mut egui::Ui, binding: &mut Binding, vars: &[UserVar]) -> boo
 mod tests {
     use super::*;
 
-    /// drive a pass without egui: `input` is this frame's state.
-    fn pass(keybinds: &mut Keybinds, mut input: InputSnapshot) -> Vec<Command> {
-        // `collect` hands a key back to the keyboard once the two agree, then
-        // folds what's left into the snapshot.
-        keybinds
-            .overrides
-            .retain(|name, &mut clicked| physical(name, &input) != Some(Value::Bool(clicked)));
-        input.overrides = keybinds.overrides.clone();
-        let now_vars: HashMap<String, Value> = keybinds
-            .vars
-            .iter()
-            .map(|var| (var.name.clone(), var.value))
-            .collect();
-        let (fired, mut errors) = keybinds.resolve(
-            Vars::new(&input, UserVars::Live(&keybinds.vars)),
-            Vars::new(
-                &keybinds.prev_input,
-                UserVars::Snapshot(&keybinds.prev_vars),
-            ),
-        );
-        let mut commands = Vec::new();
-        match fired.first().map(|f| f.action.clone()) {
-            Some(Ok((_, Action::Command(command)))) => commands.push(command),
-            Some(Ok((_, Action::SetVar { name, value }))) => {
-                if let Err(e) = keybinds.set_var(&name, value) {
-                    errors.push(e);
-                }
-            }
-            Some(Err(_)) | None => (),
-        }
-        keybinds.prev_input = input;
-        keybinds.prev_vars = now_vars;
-        if !fired.is_empty() {
-            keybinds.last_fired = fired;
-        }
-        keybinds.errors = errors;
-        commands
+    /// stage one frame: clear the per-pass press marks, let `setup` mutate the
+    /// persistent input the way this frame's events (or a reference click)
+    /// would, then run the pass — exactly what `collect` does once it has
+    /// applied egui's events.
+    fn frame(keybinds: &mut Keybinds, setup: impl FnOnce(&mut InputState)) -> Vec<Command> {
+        keybinds.input.pressed.clear();
+        keybinds.input.mouse_pressed = [false; 3];
+        setup(&mut keybinds.input);
+        keybinds.run_pass()
     }
 
     /// the default variables, but a hand-written binding tree.
@@ -1329,25 +1377,10 @@ mod tests {
         }
     }
 
-    fn holding(keys: &[egui::Key]) -> InputSnapshot {
-        InputSnapshot {
-            keys: keys.iter().copied().collect(),
-            ..InputSnapshot::default()
-        }
-    }
-
-    fn hovering(grip: Side, left: bool) -> InputSnapshot {
-        InputSnapshot {
-            mouse: [left, false, false],
-            hovered_grip: Some(grip),
-            ..InputSnapshot::default()
-        }
-    }
-
     #[test]
     fn a_held_key_twists_once() {
         let mut keybinds = Keybinds::default();
-        let commands = pass(&mut keybinds, holding(&[egui::Key::R]));
+        let commands = frame(&mut keybinds, |i| i.press(egui::Key::R));
         assert!(matches!(
             commands[..],
             [Command::Twist {
@@ -1360,41 +1393,38 @@ mod tests {
             }]
         ));
         // still held: no new edge, no repeat.
-        assert!(pass(&mut keybinds, holding(&[egui::Key::R])).is_empty());
+        assert!(frame(&mut keybinds, |_| {}).is_empty());
         // released and pressed again: another twist.
-        assert!(pass(&mut keybinds, holding(&[])).is_empty());
-        assert_eq!(pass(&mut keybinds, holding(&[egui::Key::R])).len(), 1);
-    }
-
-    /// what `capture` builds for a press: the key is down for this frame even
-    /// if the release already arrived.
-    fn tapping(key: egui::Key) -> InputSnapshot {
-        InputSnapshot {
-            keys: HashSet::from([key]),
-            pressed: HashSet::from([key]),
-            ..InputSnapshot::default()
-        }
+        assert!(frame(&mut keybinds, |i| i.release(egui::Key::R)).is_empty());
+        assert_eq!(frame(&mut keybinds, |i| i.press(egui::Key::R)).len(), 1);
     }
 
     #[test]
-    fn a_press_fires_even_when_the_key_never_looked_up() {
+    fn a_tap_too_short_to_span_a_frame_still_fires() {
         let mut keybinds = Keybinds::default();
-        assert_eq!(pass(&mut keybinds, tapping(egui::Key::R)).len(), 1);
-        // a tap too short to span a frame, or a release macOS swallowed while
-        // cmd was held: either way the press event is a new edge.
-        assert_eq!(pass(&mut keybinds, tapping(egui::Key::R)).len(), 1);
-        // merely staying down is not.
-        assert!(pass(&mut keybinds, holding(&[egui::Key::R])).is_empty());
+        // press and release inside one frame: the key is down for that frame
+        // (a real false -> true across the boundary), so the twist isn't lost.
+        assert_eq!(
+            frame(&mut keybinds, |i| {
+                i.press(egui::Key::R);
+                i.release(egui::Key::R);
+            })
+            .len(),
+            1
+        );
+        // the next frame clears the press mark: nothing stays held, and it
+        // doesn't fire a second time.
+        assert!(frame(&mut keybinds, |_| {}).is_empty());
+        assert!(!keybinds.is_down("key_r"));
     }
 
     #[test]
     fn shift_inverts_through_the_invert_expression() {
         let mut keybinds = Keybinds::default();
-        let shift = InputSnapshot {
-            modifiers: egui::Modifiers::SHIFT,
-            ..holding(&[egui::Key::R])
-        };
-        let commands = pass(&mut keybinds, shift);
+        let commands = frame(&mut keybinds, |i| {
+            i.modifiers.shift = true;
+            i.press(egui::Key::R);
+        });
         assert!(matches!(
             commands[..],
             [Command::Twist {
@@ -1409,7 +1439,7 @@ mod tests {
 
     #[test]
     fn guards_dont_fire_on_their_own_edge() {
-        // hold r with the guard false...
+        // press r with the guard false...
         let mut keybinds = keybinds_with(vec![binding(
             "key_r",
             "toggle",
@@ -1420,19 +1450,22 @@ mod tests {
             value: Value::Bool(false),
             pinned: false,
         });
-        assert!(pass(&mut keybinds, holding(&[egui::Key::R])).is_empty());
+        assert!(frame(&mut keybinds, |i| i.press(egui::Key::R)).is_empty());
         // ...then make the guard true while r is still held. the guard's own
         // edge is not the trigger's, so nothing fires.
         *keybinds.var_mut("toggle").unwrap() = Value::Bool(true);
-        assert!(pass(&mut keybinds, holding(&[egui::Key::R])).is_empty());
+        assert!(frame(&mut keybinds, |_| {}).is_empty());
     }
 
     #[test]
     fn the_mouse_twists_the_hovered_grip() {
         let mut keybinds = Keybinds::default();
         // hovering without pressing does nothing.
-        assert!(pass(&mut keybinds, hovering(Side::U, false)).is_empty());
-        let commands = pass(&mut keybinds, hovering(Side::U, true));
+        assert!(frame(&mut keybinds, |i| i.hovered_grip = Some(Side::U)).is_empty());
+        let commands = frame(&mut keybinds, |i| {
+            i.hovered_grip = Some(Side::U);
+            i.mouse_press(0);
+        });
         assert!(matches!(
             commands[..],
             [Command::Twist {
@@ -1446,18 +1479,14 @@ mod tests {
         ));
         // pressing with no grip under the pointer is guarded out.
         let mut keybinds = Keybinds::default();
-        let clicking_nothing = InputSnapshot {
-            mouse: [true, false, false],
-            ..InputSnapshot::default()
-        };
-        assert!(pass(&mut keybinds, clicking_nothing).is_empty());
+        assert!(frame(&mut keybinds, |i| i.mouse_press(0)).is_empty());
     }
 
     #[test]
     fn the_default_mask_variable_drives_the_twist() {
         let mut keybinds = Keybinds::default();
         *keybinds.var_mut("default_mask").unwrap() = Value::Mask(LayerMask(0b011));
-        let commands = pass(&mut keybinds, holding(&[egui::Key::F]));
+        let commands = frame(&mut keybinds, |i| i.press(egui::Key::F));
         assert!(matches!(
             commands[..],
             [Command::Twist {
@@ -1479,20 +1508,18 @@ mod tests {
         assert_eq!(preview.location, "twists / key_r");
         assert!(keybinds.preview("key_q", None).is_none());
         // nothing moved: a preview is a question, not a press.
-        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+        assert!(frame(&mut keybinds, |_| {}).is_empty());
 
         // it answers for the state as it is, so a held modifier changes it.
-        pass(
-            &mut keybinds,
-            InputSnapshot {
-                modifiers: egui::Modifiers::SHIFT,
-                ..InputSnapshot::default()
-            },
-        );
+        frame(&mut keybinds, |i| i.modifiers.shift = true);
         assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2'");
         // and a key already held down still previews, so the reference doesn't
-        // blank out the key you're pressing.
-        pass(&mut keybinds, holding(&[egui::Key::R]));
+        // blank out the key you're pressing. shift is persistent now, so
+        // releasing it is its own event.
+        frame(&mut keybinds, |i| {
+            i.modifiers.shift = false;
+            i.press(egui::Key::R);
+        });
         assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2");
     }
 
@@ -1520,37 +1547,37 @@ mod tests {
         let mut keybinds = Keybinds::default();
         keybinds.toggle("key_r");
         // clicking it down is a press...
-        assert_eq!(pass(&mut keybinds, holding(&[])).len(), 1);
+        assert_eq!(frame(&mut keybinds, |_| {}).len(), 1);
         assert!(keybinds.is_down("key_r"));
         // ...and staying down is not another one.
-        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+        assert!(frame(&mut keybinds, |_| {}).is_empty());
         // it reads as down everywhere, so a guard on it sees it too. previews
         // are against the last pass, which the app runs every frame.
         keybinds.toggle("key_shift");
-        pass(&mut keybinds, holding(&[]));
+        frame(&mut keybinds, |_| {});
         assert_eq!(keybinds.preview("key_u", None).unwrap().label, "U/2'");
         // clicking again releases it, and a release fires nothing.
         keybinds.toggle("key_r");
         assert!(!keybinds.is_down("key_r"));
-        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+        assert!(frame(&mut keybinds, |_| {}).is_empty());
     }
 
     #[test]
-    fn the_keyboard_takes_back_a_key_the_reference_clicked() {
+    fn a_physical_press_while_clicked_down_is_not_an_edge() {
         let mut keybinds = Keybinds::default();
         keybinds.toggle("key_r");
-        assert_eq!(pass(&mut keybinds, holding(&[])).len(), 1);
+        assert_eq!(frame(&mut keybinds, |_| {}).len(), 1);
 
-        // press it for real: the override and the keyboard now agree, so the
-        // keyboard owns the key again...
-        assert!(pass(&mut keybinds, holding(&[egui::Key::R])).is_empty());
+        // press it for real while it's already down: the variable was already
+        // true, so there's no false -> true edge and nothing fires. an edge is
+        // the variable's transition, not the physical key's.
+        assert!(frame(&mut keybinds, |i| i.press(egui::Key::R)).is_empty());
         assert!(keybinds.is_down("key_r"));
-        // ...and releasing it really releases it, rather than leaving the
-        // clicked-down state behind.
-        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+        // releasing it clears the same bit the click set.
+        assert!(frame(&mut keybinds, |i| i.release(egui::Key::R)).is_empty());
         assert!(!keybinds.is_down("key_r"));
-        // so the next physical press is a fresh edge.
-        assert_eq!(pass(&mut keybinds, holding(&[egui::Key::R])).len(), 1);
+        // now that it's up, a fresh press really is an edge.
+        assert_eq!(frame(&mut keybinds, |i| i.press(egui::Key::R)).len(), 1);
     }
 
     #[test]
@@ -1558,7 +1585,7 @@ mod tests {
         let mut keybinds = Keybinds::default();
         // r is pressed for real this pass. asking what *q* would do must not
         // come back with r's twist, or the whole reference flashes at once.
-        pass(&mut keybinds, tapping(egui::Key::R));
+        frame(&mut keybinds, |i| i.press(egui::Key::R));
         assert!(keybinds.preview("key_q", None).is_none());
         assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2");
     }
@@ -1569,7 +1596,7 @@ mod tests {
     fn the_editor_draws() {
         let mut keybinds = Keybinds::default();
         // something in the resolution set, so the report has rows to draw.
-        pass(&mut keybinds, holding(&[egui::Key::R]));
+        frame(&mut keybinds, |i| i.press(egui::Key::R));
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
             keybinds.ui(ui, |ui| {
@@ -1586,7 +1613,7 @@ mod tests {
             panic!("the first default folder is the twists");
         };
         twists.guard = ExprField::new("false");
-        assert!(pass(&mut keybinds, holding(&[egui::Key::R])).is_empty());
+        assert!(frame(&mut keybinds, |i| i.press(egui::Key::R)).is_empty());
     }
 
     #[test]
@@ -1599,7 +1626,7 @@ mod tests {
                 value: ExprField::new("{1,2}"),
             },
         )]);
-        pass(&mut keybinds, holding(&[egui::Key::A]));
+        frame(&mut keybinds, |i| i.press(egui::Key::A));
         assert_eq!(keybinds.default_mask(), LayerMask(0b011));
     }
 
@@ -1617,7 +1644,7 @@ mod tests {
             unreachable!()
         };
         *multiplicity = ExprField::new("1");
-        assert!(pass(&mut keybinds, holding(&[egui::Key::A])).is_empty());
+        assert!(frame(&mut keybinds, |i| i.press(egui::Key::A)).is_empty());
         // and it says why, rather than failing silently.
         assert!(keybinds.last_fired[0].action.is_err());
     }

@@ -11,6 +11,7 @@
 - timer
 - sidebar
 - log files
+    - also for editing eg all keybinds or just keybind folders with text
 - fmc timeline
     - operations twist, macro, fork, niss, mark/comment
     - fork is how you search different paths
@@ -87,6 +88,7 @@
 - rename PieceSetTerm to Block (kinda wrong if they include orbits ig)
     - ask on discord about what a piece type is vs orbit
 - maybe: factor out filter state (selected index)
+- tint style
 
 ## styles
 
@@ -113,5 +115,4 @@ mouse and key events are commands,
 toggled
 - i kinda want default_mask to be derived from 3 boolean flags, which then select 3 masks which are then ored together
 - the physical key presses and keybind ref click toggle and status bar variable set should be `Command`s and go in the log file
-- why do we need a separate `overrides`? can't we just toggle whether it's in held set?
 - make the sidebar a horizontal scroll area as well
