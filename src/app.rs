@@ -5,6 +5,7 @@ use eframe::egui;
 use crate::{
     commands::{Command, Origin},
     filters::Filters,
+    keybind_reference::KeybindReference,
     keybinds::{self, InputContext, Keybinds},
     puzzle_state::*,
     puzzle_view::*,
@@ -49,6 +50,7 @@ pub struct App {
     sim: PuzzleSimulation,
     puzzle_view: PuzzleView,
     keybinds: Keybinds,
+    reference: KeybindReference,
     filters: Filters,
     style_editor: StyleEditor,
     sidebar_tab: SidebarTab,
@@ -68,6 +70,7 @@ impl App {
             sim: PuzzleSimulation::new(PuzzleState::new()),
             puzzle_view: PuzzleView::new(render_state),
             keybinds: Keybinds::default(),
+            reference: KeybindReference::default(),
             filters,
             style_editor,
             sidebar_tab: SidebarTab::Twists,
@@ -160,9 +163,29 @@ impl eframe::App for App {
                 SidebarTab::View => self.puzzle_view.ui(ui),
                 SidebarTab::Filters => self.filters.ui(ui, &self.style_editor.styles),
                 SidebarTab::Styles => self.style_editor.ui(ui),
-                SidebarTab::Keybinds => self.keybinds.ui(ui),
+                SidebarTab::Keybinds => {
+                    ui.checkbox(&mut self.reference.open, "show reference");
+                    self.keybinds.ui(ui);
+                }
             });
         });
+
+        // a floating window for now; it takes a plain `Ui`, so it can move
+        // into a dock or the sidebar later without changing.
+        if self.reference.open {
+            // the window's own close button writes back into `open`, which the
+            // reference can't borrow while it's drawing itself.
+            let mut open = true;
+            {
+                let reference = &mut self.reference;
+                let keybinds = &mut self.keybinds;
+                egui::Window::new("keybind reference")
+                    .open(&mut open)
+                    .default_width(760.0)
+                    .show(ui.ctx(), |ui| reference.ui(ui, keybinds));
+            }
+            self.reference.open = open;
+        }
 
         // the pinned keybind variables. only there once something is pinned,
         // so an unused bar doesn't eat a strip of the window.
@@ -202,12 +225,29 @@ impl eframe::App for App {
             let stable_dt = ui.ctx().input(|i| i.stable_dt);
             self.sim
                 .tick(now, stable_dt, self.puzzle_view.twist_duration);
+            // What a left click on each gizmo would twist, asked of the
+            // bindings themselves rather than assumed: the gizmo turns red
+            // when the twist that clicking it inputs is blocked, whatever the
+            // mouse bindings happen to say. Direction doesn't matter here —
+            // blocking depends only on the side and the layers.
+            let gizmo_blocked = Side::ALL.map(|side| {
+                self.keybinds
+                    .preview("mouse_left", Some(side))
+                    .and_then(|preview| match preview.command {
+                        Some(Command::Twist { twist, .. }) => {
+                            Some(self.sim.puzzle().twist_pieces(twist).is_err())
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or(false)
+            });
+
             self.puzzle_view.draw(
                 &self.sim,
                 &self.filters,
                 &self.style_editor.styles,
                 &hover,
-                self.keybinds.default_mask(),
+                gizmo_blocked,
                 &ui.painter_at(rect),
                 now,
             );

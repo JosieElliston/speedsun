@@ -417,6 +417,11 @@ impl PuzzleView {
 
     /// Render the puzzle: read-only against the simulation, filters, and
     /// styles.
+    ///
+    /// `gizmo_blocked` says, for each of `Side::ALL`, whether the twist that
+    /// clicking that gizmo would input is blocked. The hub gets it by asking
+    /// the keybinds what a click resolves to, so the gizmos show what the
+    /// mouse bindings actually do rather than a twist this view made up.
     #[expect(
         clippy::too_many_arguments,
         reason = "the main puzzle render is the deliberate many-component reader"
@@ -427,7 +432,7 @@ impl PuzzleView {
         filters: &Filters,
         styles: &Styles,
         hover: &Hover,
-        layers: LayerMask,
+        gizmo_blocked: [bool; 6],
         painter: &egui::Painter,
         now: Instant,
     ) {
@@ -547,22 +552,19 @@ impl PuzzleView {
         // the twist a face inputs is currently blocked. Normally only the
         // hovered face is drawn; show_gizmos draws all of them, with the
         // unhovered ones dimmed.
-        let gizmo_faces: Vec<Side> = if self.show_gizmos {
-            Side::ALL.to_vec()
+        let gizmo_faces: Vec<usize> = if self.show_gizmos {
+            (0..Side::ALL.len()).collect()
         } else {
-            hover.gizmo.iter().map(|&(side, _)| side).collect()
+            hover
+                .gizmo
+                .iter()
+                .filter_map(|&(side, _)| Side::ALL.iter().position(|&s| s == side))
+                .collect()
         };
         let mut gizmo_vertices: Vec<Vertex> = Vec::new();
-        for side in gizmo_faces {
-            let blocked = sim
-                .puzzle()
-                .twist_pieces(Twist {
-                    side,
-                    layers,
-                    multiplicity: 1,
-                })
-                .is_err();
-            let mut rgb = if blocked {
+        for side_idx in gizmo_faces {
+            let side = Side::ALL[side_idx];
+            let mut rgb = if gizmo_blocked[side_idx] {
                 (1.0, 0.0, 0.0)
             } else {
                 (0.3, 0.5, 1.0)

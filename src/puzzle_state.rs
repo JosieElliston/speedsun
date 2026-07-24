@@ -36,6 +36,17 @@ impl Side {
         }
     }
 
+    pub fn opposite(self) -> Side {
+        match self {
+            Side::R => Side::L,
+            Side::L => Side::R,
+            Side::U => Side::D,
+            Side::D => Side::U,
+            Side::F => Side::B,
+            Side::B => Side::F,
+        }
+    }
+
     /// the coordinate axis the side lies on, and its sign along it. lets a
     /// grip stand in for an axis, so a reorientation can be named by the side
     /// it turns like (`U` turns the puzzle the way a `U` twist turns its layer).
@@ -433,6 +444,8 @@ impl LayerMask {
     pub const NONE: Self = Self(0);
     /// just the layer touching the side: an ordinary face twist.
     pub const OUTER: Self = Self(0b001);
+    /// every layer: a whole-puzzle rotation, which nothing can block.
+    pub const ALL: Self = Self(0b111);
 
     pub const fn layer(layer: u8) -> Self {
         Self(1 << layer)
@@ -449,9 +462,21 @@ impl LayerMask {
             self.0 &= !Self::layer(layer).0;
         }
     }
+
+    /// the same layers counted from the opposite side, which is how the same
+    /// twist looks when named from there.
+    pub fn reversed(self) -> Self {
+        let mut reversed = Self::NONE;
+        for layer in 0..Self::N_LAYERS {
+            reversed.set(Self::N_LAYERS - 1 - layer, self.contains(layer));
+        }
+        reversed
+    }
 }
 impl fmt::Display for LayerMask {
-    /// the same syntax keybind expressions use, e.g. `{0,1}`.
+    /// the same syntax keybind expressions use, e.g. `{1,2}`. layers are
+    /// numbered from 1 everywhere the user can see them, even though the bits
+    /// are indexed from 0.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{{")?;
         let mut first = true;
@@ -460,7 +485,7 @@ impl fmt::Display for LayerMask {
                 if !first {
                     write!(f, ",")?;
                 }
-                write!(f, "{layer}")?;
+                write!(f, "{}", layer + 1)?;
                 first = false;
             }
         }

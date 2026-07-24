@@ -22,6 +22,7 @@ use eframe::egui::{self, collapsing_header::CollapsingState};
 use crate::{
     commands::{Command, Origin},
     expr::{self, ExprField, Type, Value},
+    notation,
     puzzle_state::{LayerMask, Reorientation, Side, Twist},
 };
 
@@ -50,9 +51,13 @@ struct InputSnapshot {
     mouse: [bool; 3],
     hovered_grip: Option<Side>,
     hovered_grip_inverted: bool,
+    /// variables the keybind reference is holding down by having been clicked.
+    /// part of the snapshot, not read live, so toggling one is a rising edge
+    /// like any other press.
+    held: HashSet<String>,
 }
 impl InputSnapshot {
-    fn capture(ctx: &egui::Context, input: &InputContext) -> Self {
+    fn capture(ctx: &egui::Context, input: &InputContext, held: &HashSet<String>) -> Self {
         // while a text field has focus, every key reads as up: typing must
         // never fire a binding, and a key held across the focus change ends
         // its press instead of firing on the way out.
@@ -99,6 +104,7 @@ impl InputSnapshot {
                 .map(|button| i.pointer.button_down(button) || i.pointer.button_pressed(button)),
                 hovered_grip: input.hovered_grip,
                 hovered_grip_inverted: input.hovered_grip_inverted,
+                held: held.clone(),
             }
         })
     }
@@ -130,10 +136,16 @@ const BUILTINS: &[(&str, Type)] = &[
     ("key_command", Type::Bool),
 ];
 
-/// egui exposes modifiers separately from keys and doesn't say which side was
-/// pressed, so there's no `key_lshift` yet; `key_command` is cmd on macOS and
-/// ctrl elsewhere, matching every other app on the platform.
+/// `key_shift` and friends are egui's modifier *state*, which doesn't say
+/// which side was pressed; the individual modifier keys are ordinary keys, so
+/// `key_shiftleft` and `key_shiftright` work too. `key_command` is cmd on
+/// macOS and ctrl elsewhere, matching every other app on the platform.
 fn builtin(name: &str, input: &InputSnapshot) -> Option<Value> {
+    // a variable the reference is holding down reads as pressed no matter what
+    // the keyboard says.
+    if input.held.contains(name) {
+        return Some(Value::Bool(true));
+    }
     Some(match name {
         "hovered_grip" => Value::Grip(input.hovered_grip),
         "hovered_grip_inverted" => Value::Bool(input.hovered_grip_inverted),
@@ -149,6 +161,19 @@ fn builtin(name: &str, input: &InputSnapshot) -> Option<Value> {
             Value::Bool(input.keys.contains(&key))
         }
     })
+}
+
+/// Is this a builtin variable's name? Doesn't depend on the input, since the
+/// set of names doesn't: every key has one whether or not it's down.
+pub fn is_builtin(name: &str) -> bool {
+    BUILTINS.iter().any(|(builtin, _)| *builtin == name)
+        || name.strip_prefix("key_").and_then(key_by_name).is_some()
+}
+
+/// does this name resolve to anything at all? a trigger naming a variable
+/// nobody declared is a typo, not an unbound key, so the editor says so.
+fn is_known(name: &str, vars: &[UserVar]) -> bool {
+    is_builtin(name) || vars.iter().any(|var| var.name == name)
 }
 
 /// keyboard layout is assumed to be the one egui reports; the names are its
@@ -176,15 +201,61 @@ pub struct UserVar {
     pub pinned: bool,
 }
 
-/// variable lookup for one pass: builtins shadow user variables, so builtin
+/// Variable lookup for one pass: builtins shadow user variables, so builtin
 /// names are effectively reserved.
+///
+/// The two overrides are what makes a preview possible — asking "what would
+/// happen if this were pressed" is the same pass with one variable answered
+/// differently, so nothing has to be mutated and put back.
 struct Vars<'a> {
     input: &'a InputSnapshot,
-    user: &'a HashMap<String, Value>,
+    user: UserVars<'a>,
+    /// this variable reads as this value, whatever the input says.
+    forced: Option<(&'a str, bool)>,
+    /// the pointer is over this grip, wherever it really is.
+    hovered_grip: Option<Side>,
+}
+impl<'a> Vars<'a> {
+    fn new(input: &'a InputSnapshot, user: UserVars<'a>) -> Self {
+        Self {
+            input,
+            user,
+            forced: None,
+            hovered_grip: None,
+        }
+    }
+}
+
+/// Where a pass reads user variables: live off the declarations, or from the
+/// snapshot of what they held during the last pass. Only rising edges need the
+/// snapshot, so everything else reads the live values and can't go stale.
+enum UserVars<'a> {
+    Live(&'a [UserVar]),
+    Snapshot(&'a HashMap<String, Value>),
+}
+impl UserVars<'_> {
+    fn get(&self, name: &str) -> Option<Value> {
+        match self {
+            // a handful of variables, so a scan beats keeping a map in sync.
+            UserVars::Live(vars) => vars
+                .iter()
+                .find(|var| var.name == name)
+                .map(|var| var.value),
+            UserVars::Snapshot(values) => values.get(name).copied(),
+        }
+    }
 }
 impl expr::Env for Vars<'_> {
     fn get(&self, name: &str) -> Option<Value> {
-        builtin(name, self.input).or_else(|| self.user.get(name).copied())
+        if let Some((forced, value)) = self.forced
+            && forced == name
+        {
+            return Some(Value::Bool(value));
+        }
+        if self.hovered_grip.is_some() && name == "hovered_grip" {
+            return Some(Value::Grip(self.hovered_grip));
+        }
+        builtin(name, self.input).or_else(|| self.user.get(name))
     }
 }
 
@@ -299,14 +370,15 @@ impl BindCommand {
                 if invert.eval(env)?.bool()? {
                     multiplicity = -multiplicity;
                 }
+                let twist = Twist {
+                    side,
+                    layers,
+                    multiplicity,
+                };
                 (
-                    format!("twist {side:?} {layers} {multiplicity}"),
+                    twist.to_string(),
                     Action::Command(Command::Twist {
-                        twist: Twist {
-                            side,
-                            layers,
-                            multiplicity,
-                        },
+                        twist,
                         origin: Origin::User,
                     }),
                 )
@@ -331,7 +403,7 @@ impl BindCommand {
                 }
                 let (axis, sign) = side.axis();
                 (
-                    format!("reorient {side:?} {multiplicity}"),
+                    notation::reorientation(side, multiplicity),
                     Action::Command(Command::Reorient {
                         reorientation: Reorientation::new(axis, sign * multiplicity),
                         origin: Origin::User,
@@ -409,6 +481,22 @@ enum Action {
     SetVar { name: String, value: Value },
 }
 
+/// What one key of the keybind reference (or one twist gizmo) would do, from
+/// [`Keybinds::preview`].
+pub struct Preview {
+    /// notation for a twist, a short phrase for anything else, `!` for a
+    /// binding that fires but can't be evaluated.
+    pub label: String,
+    /// the enclosing folder's color.
+    pub color: egui::Color32,
+    /// "twists / key_r", for a tooltip.
+    pub location: String,
+    /// what it would run, for a caller that wants to ask more of it: the
+    /// gizmos ask whether the twist is blocked.
+    pub command: Option<Command>,
+    pub error: Option<String>,
+}
+
 /// one binding that fired: it made it into the resolution set, whether or not
 /// it was the one that executed.
 #[derive(Debug, Clone)]
@@ -421,6 +509,18 @@ struct Fired {
     action: Result<(String, Action), String>,
 }
 
+/// "twists / key_r": where a binding lives, for the report and the reference's
+/// tooltips.
+fn location(path: &[&str], name: &str) -> String {
+    let mut location = String::new();
+    for folder in path {
+        location.push_str(folder);
+        location.push_str(" / ");
+    }
+    location.push_str(name);
+    location
+}
+
 /// one walk of the folder tree.
 struct Pass<'a> {
     env: Vars<'a>,
@@ -431,40 +531,49 @@ struct Pass<'a> {
     /// false, so the binding just doesn't fire.
     errors: Vec<String>,
 }
-impl Pass<'_> {
-    fn walk(&mut self, nodes: &[Node], path: &str, color: egui::Color32) {
+impl<'a> Pass<'a> {
+    /// `path` is the stack of enclosing folder names. it stays a stack rather
+    /// than a formatted string because the keybind reference runs a pass per
+    /// key every frame, and almost none of them fire.
+    fn walk(&mut self, nodes: &'a [Node], path: &mut Vec<&'a str>, color: egui::Color32) {
         for node in nodes {
             match node {
                 Node::Folder(folder) => match folder.guard.eval_bool(&self.env) {
-                    Ok(true) => self.walk(
-                        &folder.children,
-                        &format!("{path}{} / ", folder.name),
-                        folder.color,
-                    ),
+                    Ok(true) => {
+                        path.push(&folder.name);
+                        self.walk(&folder.children, path, folder.color);
+                        path.pop();
+                    }
                     Ok(false) => (),
-                    Err(e) => self
-                        .errors
-                        .push(format!("{path}{}: guard: {e}", folder.name)),
+                    Err(e) => {
+                        let location = location(path, &folder.name);
+                        self.errors.push(format!("{location}: guard: {e}"));
+                    }
                 },
                 Node::Binding(binding) => self.binding(binding, path, color),
             }
         }
     }
 
-    fn binding(&mut self, binding: &Binding, path: &str, color: egui::Color32) {
-        let location = format!("{path}{}", binding.trigger);
+    fn binding(&mut self, binding: &Binding, path: &[&str], color: egui::Color32) {
         match self.rising(&binding.trigger) {
             Ok(false) => return,
-            Err(e) => return self.errors.push(format!("{location}: {e}")),
+            Err(e) => {
+                let location = location(path, &binding.trigger);
+                return self.errors.push(format!("{location}: {e}"));
+            }
             Ok(true) => (),
         }
         match binding.guard.eval_bool(&self.env) {
             Ok(false) => return,
-            Err(e) => return self.errors.push(format!("{location}: guard: {e}")),
+            Err(e) => {
+                let location = location(path, &binding.trigger);
+                return self.errors.push(format!("{location}: guard: {e}"));
+            }
             Ok(true) => (),
         }
         self.fired.push(Fired {
-            location,
+            location: location(path, &binding.trigger),
             color,
             action: binding.command.eval(&self.env),
         });
@@ -496,9 +605,12 @@ impl Pass<'_> {
 pub struct Keybinds {
     vars: Vec<UserVar>,
     root: Vec<Node>,
-    /// last pass's input and variable values, for finding rising edges.
+    /// last pass's input and variable values, for finding rising edges. also
+    /// what previews are evaluated against.
     prev_input: InputSnapshot,
     prev_vars: HashMap<String, Value>,
+    /// variables the reference is holding down; see `InputSnapshot::held`.
+    held: HashSet<String>,
     /// the last *non-empty* resolution set: a pass that fired nothing would
     /// wipe the display a frame after the twist it explains.
     last_fired: Vec<Fired>,
@@ -583,6 +695,7 @@ impl Default for Keybinds {
             ],
             prev_input: InputSnapshot::default(),
             prev_vars: HashMap::new(),
+            held: HashSet::new(),
             last_fired: Vec::new(),
             errors: Vec::new(),
         }
@@ -593,29 +706,17 @@ impl Keybinds {
     /// set. Only the first command executes for now, which also enforces the
     /// speedsolving rule of at most one twist per pass.
     pub fn collect(&mut self, ctx: &egui::Context, input: &InputContext) -> Vec<Command> {
-        let now_input = InputSnapshot::capture(ctx, input);
+        let now_input = InputSnapshot::capture(ctx, input, &self.held);
         let now_vars: HashMap<String, Value> = self
             .vars
             .iter()
             .map(|var| (var.name.clone(), var.value))
             .collect();
 
-        let mut pass = Pass {
-            env: Vars {
-                input: &now_input,
-                user: &now_vars,
-            },
-            prev: Vars {
-                input: &self.prev_input,
-                user: &self.prev_vars,
-            },
-            fired: Vec::new(),
-            errors: Vec::new(),
-        };
-        pass.walk(&self.root, "", ROOT_COLOR);
-        let Pass {
-            fired, mut errors, ..
-        } = pass;
+        let (fired, mut errors) = self.resolve(
+            Vars::new(&now_input, UserVars::Live(&self.vars)),
+            Vars::new(&self.prev_input, UserVars::Snapshot(&self.prev_vars)),
+        );
 
         let mut commands = Vec::new();
         match fired.first().map(|f| f.action.clone()) {
@@ -639,6 +740,75 @@ impl Keybinds {
         }
         self.errors = errors;
         commands
+    }
+
+    /// One walk of the tree against a given view of the variables. Pure: both
+    /// the real pass and the reference's hypothetical ones go through here,
+    /// and neither changes anything.
+    fn resolve(&self, env: Vars<'_>, prev: Vars<'_>) -> (Vec<Fired>, Vec<String>) {
+        let mut pass = Pass {
+            env,
+            prev,
+            fired: Vec::new(),
+            errors: Vec::new(),
+        };
+        pass.walk(&self.root, &mut Vec::new(), ROOT_COLOR);
+        (pass.fired, pass.errors)
+    }
+
+    /// What the pass would do if `variable` were pressed right now — the label
+    /// for one key of the reference, or the twist a gizmo click would input.
+    /// Nothing is executed and nothing changes.
+    ///
+    /// Everything else keeps the state of the last real pass, so held
+    /// modifiers and held variables are accounted for. `hovered_grip` asks the
+    /// hypothetical "if the pointer were over this gizmo"; `None` uses
+    /// wherever the pointer really is.
+    pub fn preview(&self, variable: &str, hovered_grip: Option<Side>) -> Option<Preview> {
+        let vars = |forced| Vars {
+            input: &self.prev_input,
+            // the variables as they are now, not as the last pass left them:
+            // the reference should answer for the state you can see.
+            user: UserVars::Live(&self.vars),
+            forced: Some((variable, forced)),
+            hovered_grip,
+        };
+        // forcing the variable off in the previous pass is what makes this a
+        // press: it rises even if the key is genuinely held down already.
+        let (fired, _) = self.resolve(vars(true), vars(false));
+        let fired = fired.into_iter().next()?;
+        Some(match fired.action {
+            Ok((label, action)) => Preview {
+                label,
+                color: fired.color,
+                location: fired.location,
+                command: match action {
+                    Action::Command(command) => Some(command),
+                    Action::SetVar { .. } => None,
+                },
+                error: None,
+            },
+            Err(e) => Preview {
+                label: "!".to_string(),
+                color: fired.color,
+                location: fired.location,
+                command: None,
+                error: Some(e),
+            },
+        })
+    }
+
+    /// is the reference holding this variable down?
+    pub fn is_held(&self, variable: &str) -> bool {
+        self.held.contains(variable)
+    }
+
+    /// Hold or release a variable from the reference. A press it makes is a
+    /// real press: the next pass sees the rising edge and the binding fires.
+    pub fn toggle_held(&mut self, variable: &str) {
+        if !self.held.remove(variable) {
+            self.held.insert(variable.to_string());
+        }
     }
 
     /// variables are typed, so a set that doesn't match is a mistake worth
@@ -719,7 +889,10 @@ impl Keybinds {
         self.ui_variables(ui);
         ui.separator();
         ui.strong("bindings");
-        ui_nodes(ui, &mut self.root);
+        // disjoint fields: the tree is edited while the variable list is
+        // read, so a trigger can be checked against the declarations.
+        let Self { vars, root, .. } = self;
+        ui_nodes(ui, root, vars);
         ui.separator();
         self.ui_report(ui);
     }
@@ -894,11 +1067,13 @@ pub fn ui_value(ui: &mut egui::Ui, value: &mut Value) {
                 });
         }
         Value::Mask(mask) => {
+            // layers are numbered from 1 for the user; layer 1 is the one
+            // touching the twisted side.
             for layer in 0..LayerMask::N_LAYERS {
                 let mut on = mask.contains(layer);
                 if ui
-                    .selectable_label(on, format!("{layer}"))
-                    .on_hover_text(format!("layer {layer}"))
+                    .selectable_label(on, format!("{}", layer + 1))
+                    .on_hover_text(format!("layer {}", layer + 1))
                     .clicked()
                 {
                     on = !on;
@@ -930,13 +1105,13 @@ fn ui_expr(ui: &mut egui::Ui, label: &str, field: &mut ExprField) {
     }
 }
 
-fn ui_nodes(ui: &mut egui::Ui, nodes: &mut Vec<Node>) {
+fn ui_nodes(ui: &mut egui::Ui, nodes: &mut Vec<Node>, vars: &[UserVar]) {
     let mut remove = None;
     for (idx, node) in nodes.iter_mut().enumerate() {
         ui.push_id(("node", idx), |ui| {
             let deleted = match node {
-                Node::Folder(folder) => ui_folder(ui, folder),
-                Node::Binding(binding) => ui_binding(ui, binding),
+                Node::Folder(folder) => ui_folder(ui, folder, vars),
+                Node::Binding(binding) => ui_binding(ui, binding, vars),
             };
             if deleted {
                 remove = Some(idx);
@@ -961,7 +1136,7 @@ fn ui_nodes(ui: &mut egui::Ui, nodes: &mut Vec<Node>) {
 }
 
 /// returns whether the folder was deleted.
-fn ui_folder(ui: &mut egui::Ui, folder: &mut Folder) -> bool {
+fn ui_folder(ui: &mut egui::Ui, folder: &mut Folder, vars: &[UserVar]) -> bool {
     let mut deleted = false;
     let state =
         CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("folder"), true);
@@ -978,13 +1153,13 @@ fn ui_folder(ui: &mut egui::Ui, folder: &mut Folder) -> bool {
     });
     header.body(|ui| {
         ui_expr(ui, "guard", &mut folder.guard);
-        ui_nodes(ui, &mut folder.children);
+        ui_nodes(ui, &mut folder.children, vars);
     });
     deleted
 }
 
 /// returns whether the binding was deleted.
-fn ui_binding(ui: &mut egui::Ui, binding: &mut Binding) -> bool {
+fn ui_binding(ui: &mut egui::Ui, binding: &mut Binding, vars: &[UserVar]) -> bool {
     let mut deleted = false;
     let state =
         CollapsingState::load_with_default_open(ui.ctx(), ui.make_persistent_id("binding"), false);
@@ -1008,6 +1183,14 @@ fn ui_binding(ui: &mut egui::Ui, binding: &mut Binding) -> bool {
                     .font(egui::TextStyle::Monospace),
             );
         });
+        // a trigger nobody declared never fires, and nothing else would say so
+        // until you pressed the key and nothing happened.
+        if !is_known(&binding.trigger, vars) {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("no variable named `{}`", binding.trigger),
+            );
+        }
         ui_expr(ui, "guard", &mut binding.guard);
         ui.horizontal(|ui| {
             ui.label("do");
@@ -1063,28 +1246,21 @@ mod tests {
     use super::*;
 
     /// drive a pass without egui: `input` is this frame's state.
-    fn pass(keybinds: &mut Keybinds, input: InputSnapshot) -> Vec<Command> {
+    fn pass(keybinds: &mut Keybinds, mut input: InputSnapshot) -> Vec<Command> {
+        // `capture` folds the reference's held variables into the snapshot.
+        input.held = keybinds.held.clone();
         let now_vars: HashMap<String, Value> = keybinds
             .vars
             .iter()
             .map(|var| (var.name.clone(), var.value))
             .collect();
-        let mut pass = Pass {
-            env: Vars {
-                input: &input,
-                user: &now_vars,
-            },
-            prev: Vars {
-                input: &keybinds.prev_input,
-                user: &keybinds.prev_vars,
-            },
-            fired: Vec::new(),
-            errors: Vec::new(),
-        };
-        pass.walk(&keybinds.root, "", egui::Color32::WHITE);
-        let Pass {
-            fired, mut errors, ..
-        } = pass;
+        let (fired, mut errors) = keybinds.resolve(
+            Vars::new(&input, UserVars::Live(&keybinds.vars)),
+            Vars::new(
+                &keybinds.prev_input,
+                UserVars::Snapshot(&keybinds.prev_vars),
+            ),
+        );
         let mut commands = Vec::new();
         match fired.first().map(|f| f.action.clone()) {
             Some(Ok((_, Action::Command(command)))) => commands.push(command),
@@ -1253,6 +1429,72 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn preview_labels_a_key_without_doing_anything() {
+        let mut keybinds = Keybinds::default();
+        // the reference asks this of every key, every frame. the default twist
+        // is one 45 deg step, which is half a quarter turn.
+        let preview = keybinds.preview("key_r", None).expect("r is bound");
+        assert_eq!(preview.label, "R/2'");
+        assert_eq!(preview.location, "twists / key_r");
+        assert!(keybinds.preview("key_q", None).is_none());
+        // nothing moved: a preview is a question, not a press.
+        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+
+        // it answers for the state as it is, so a held modifier changes it.
+        pass(
+            &mut keybinds,
+            InputSnapshot {
+                modifiers: egui::Modifiers::SHIFT,
+                ..InputSnapshot::default()
+            },
+        );
+        assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2");
+        // and a key already held down still previews, so the reference doesn't
+        // blank out the key you're pressing.
+        pass(&mut keybinds, holding(&[egui::Key::R]));
+        assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2'");
+    }
+
+    #[test]
+    fn preview_answers_what_clicking_a_gizmo_would_twist() {
+        let keybinds = Keybinds::default();
+        // the pointer is nowhere near a gizmo, so a click does nothing...
+        assert!(keybinds.preview("mouse_left", None).is_none());
+        // ...but the gizmos ask the hypothetical anyway.
+        let preview = keybinds
+            .preview("mouse_left", Some(Side::U))
+            .expect("the default set twists on left click");
+        assert_eq!(preview.label, "U/2'");
+        assert!(matches!(
+            preview.command,
+            Some(Command::Twist {
+                twist: Twist { side: Side::U, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn a_key_held_by_the_reference_presses_once_and_stays_down() {
+        let mut keybinds = Keybinds::default();
+        keybinds.toggle_held("key_r");
+        assert!(keybinds.is_held("key_r"));
+        // holding it down is a press.
+        assert_eq!(pass(&mut keybinds, holding(&[])).len(), 1);
+        // and staying down is not another one.
+        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+        // it reads as held everywhere, so a guard on it sees it too. previews
+        // are against the last pass, which the app runs every frame.
+        keybinds.toggle_held("key_shift");
+        pass(&mut keybinds, holding(&[]));
+        assert_eq!(keybinds.preview("key_u", None).unwrap().label, "U/2");
+        // releasing doesn't fire anything.
+        keybinds.toggle_held("key_r");
+        assert!(!keybinds.is_held("key_r"));
+        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+    }
+
     /// the editor is a lot of tree-walking UI; run it headlessly so a panic in
     /// it can't wait for someone to open the tab.
     #[test]
@@ -1284,7 +1526,7 @@ mod tests {
             "true",
             BindCommand::SetVar {
                 name: "default_mask".to_string(),
-                value: ExprField::new("{0,1}"),
+                value: ExprField::new("{1,2}"),
             },
         )]);
         pass(&mut keybinds, holding(&[egui::Key::A]));

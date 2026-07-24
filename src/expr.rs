@@ -19,6 +19,9 @@
 //!           | "R" | "L" | "U" | "D" | "F" | "B"
 //! ```
 //!
+//! Layer masks are written `{1,2}` and count from 1, matching what the mask
+//! editor and [`crate::notation`] show.
+//!
 //! Identifiers name variables and are lowercase by convention; the six
 //! uppercase side letters are grip literals instead.
 
@@ -451,10 +454,13 @@ impl Parser {
         }
         loop {
             match self.next() {
-                Some(Token::Int(n)) if n < LayerMask::N_LAYERS as i64 => mask.set(n as u8, true),
+                // layers are numbered from 1 wherever the user can see them.
+                Some(Token::Int(n)) if (1..=LayerMask::N_LAYERS as i64).contains(&n) => {
+                    mask.set(n as u8 - 1, true);
+                }
                 Some(Token::Int(n)) => {
                     return Err(format!(
-                        "layer `{n}`: the puzzle has layers 0..{}",
+                        "layer `{n}`: the puzzle's layers are 1 to {}",
                         LayerMask::N_LAYERS
                     ));
                 }
@@ -504,11 +510,14 @@ mod tests {
         assert_eq!(eval("key_shift"), Ok(Value::Bool(true)));
         assert_eq!(eval("U"), Ok(Value::Grip(Some(Side::U))));
         assert_eq!(eval("null"), Ok(Value::Grip(None)));
-        assert_eq!(eval("{0,1}"), Ok(Value::Mask(LayerMask(0b011))));
+        // layers count from 1, so `{1,2}` is the outer two.
+        assert_eq!(eval("{1,2}"), Ok(Value::Mask(LayerMask(0b011))));
+        assert_eq!(eval("{3}"), Ok(Value::Mask(LayerMask(0b100))));
         assert_eq!(eval("{}"), Ok(Value::Mask(LayerMask::NONE)));
         assert_eq!(eval("-2"), Ok(Value::Multiplicity(-2)));
         assert!(eval("nope").is_err());
-        assert!(eval("{3}").is_err());
+        assert!(eval("{0}").is_err());
+        assert!(eval("{4}").is_err());
     }
 
     #[test]
@@ -518,7 +527,7 @@ mod tests {
         assert_eq!(eval("false && (false || true)"), Ok(Value::Bool(false)));
         // comparison binds tighter than `&&`.
         assert_eq!(
-            eval("key_shift && default_mask == {0}"),
+            eval("key_shift && default_mask == {1}"),
             Ok(Value::Bool(true))
         );
         // `??` binds tighter than `==`.
@@ -533,7 +542,7 @@ mod tests {
         assert!(eval("key_shift && U").is_err());
         assert!(eval("!default_mask").is_err());
         // only grips are nullable, so `??` on anything else is a mistake.
-        assert!(eval("default_mask ?? {1}").is_err());
+        assert!(eval("default_mask ?? {2}").is_err());
         // comparing different types is a mistake too, not just false.
         assert!(eval("default_mask == 1").is_err());
     }
