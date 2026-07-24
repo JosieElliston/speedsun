@@ -51,13 +51,13 @@ struct InputSnapshot {
     mouse: [bool; 3],
     hovered_grip: Option<Side>,
     hovered_grip_inverted: bool,
-    /// variables the keybind reference is holding down by having been clicked.
-    /// part of the snapshot, not read live, so toggling one is a rising edge
+    /// variables the keybind reference has clicked into a state of their own.
+    /// part of the snapshot, not read live, so clicking one is a rising edge
     /// like any other press.
-    held: HashSet<String>,
+    overrides: HashMap<String, bool>,
 }
 impl InputSnapshot {
-    fn capture(ctx: &egui::Context, input: &InputContext, held: &HashSet<String>) -> Self {
+    fn capture(ctx: &egui::Context, input: &InputContext) -> Self {
         // while a text field has focus, every key reads as up: typing must
         // never fire a binding, and a key held across the focus change ends
         // its press instead of firing on the way out.
@@ -104,7 +104,9 @@ impl InputSnapshot {
                 .map(|button| i.pointer.button_down(button) || i.pointer.button_pressed(button)),
                 hovered_grip: input.hovered_grip,
                 hovered_grip_inverted: input.hovered_grip_inverted,
-                held: held.clone(),
+                // filled in by `collect`, once it knows which overrides the
+                // real input has taken back.
+                overrides: HashMap::new(),
             }
         })
     }
@@ -141,11 +143,16 @@ const BUILTINS: &[(&str, Type)] = &[
 /// `key_shiftleft` and `key_shiftright` work too. `key_command` is cmd on
 /// macOS and ctrl elsewhere, matching every other app on the platform.
 fn builtin(name: &str, input: &InputSnapshot) -> Option<Value> {
-    // a variable the reference is holding down reads as pressed no matter what
-    // the keyboard says.
-    if input.held.contains(name) {
-        return Some(Value::Bool(true));
+    // a variable the reference has clicked reads as it clicked it, until the
+    // real input catches up (see `collect`).
+    if let Some(&overridden) = input.overrides.get(name) {
+        return Some(Value::Bool(overridden));
     }
+    physical(name, input)
+}
+
+/// what the keyboard and mouse actually say, ignoring the reference.
+fn physical(name: &str, input: &InputSnapshot) -> Option<Value> {
     Some(match name {
         "hovered_grip" => Value::Grip(input.hovered_grip),
         "hovered_grip_inverted" => Value::Bool(input.hovered_grip_inverted),
@@ -174,6 +181,11 @@ pub fn is_builtin(name: &str) -> bool {
 /// nobody declared is a typo, not an unbound key, so the editor says so.
 fn is_known(name: &str, vars: &[UserVar]) -> bool {
     is_builtin(name) || vars.iter().any(|var| var.name == name)
+}
+
+/// the variable a key is read through: `key_` + its egui name, lowercased.
+pub fn key_variable(key: egui::Key) -> String {
+    format!("key_{}", format!("{key:?}").to_lowercase())
 }
 
 /// keyboard layout is assumed to be the one egui reports; the names are its
@@ -591,6 +603,13 @@ impl<'a> Pass<'a> {
         if !now {
             return Ok(false);
         }
+        // While previewing, the only edge is the hypothetical one being asked
+        // about. Everything else is steady however it got to be down —
+        // otherwise a key pressed for real would answer every cell of the
+        // reference with its own twist for that frame.
+        if let Some((forced, _)) = self.env.forced {
+            return Ok(forced == trigger);
+        }
         // a variable that didn't exist last pass counts as not-true.
         let was = self
             .prev
@@ -609,8 +628,8 @@ pub struct Keybinds {
     /// what previews are evaluated against.
     prev_input: InputSnapshot,
     prev_vars: HashMap<String, Value>,
-    /// variables the reference is holding down; see `InputSnapshot::held`.
-    held: HashSet<String>,
+    /// variables the reference has clicked; see `InputSnapshot::overrides`.
+    overrides: HashMap<String, bool>,
     /// the last *non-empty* resolution set: a pass that fired nothing would
     /// wipe the display a frame after the twist it explains.
     last_fired: Vec<Fired>,
@@ -620,9 +639,9 @@ pub struct Keybinds {
 }
 impl Default for Keybinds {
     /// The default set, which is also the worked example of what the system
-    /// can say. Note `default_multiplicity` is -1: one 45 deg step in the
-    /// direction a plain keypress and a left click twist, so `invert` reads as
-    /// "the other way" everywhere.
+    /// can say. `default_multiplicity` is 1 — one 45 deg step, the puzzle's
+    /// fundamental twist — in the direction a plain keypress and a left click
+    /// twist, so `invert` reads as "the other way" everywhere.
     fn default() -> Self {
         let twists = Side::ALL
             .map(|side| {
@@ -643,7 +662,7 @@ impl Default for Keybinds {
                 },
                 UserVar {
                     name: "default_multiplicity".to_string(),
-                    value: Value::Multiplicity(-1),
+                    value: Value::Multiplicity(1),
                     pinned: false,
                 },
             ],
@@ -695,7 +714,7 @@ impl Default for Keybinds {
             ],
             prev_input: InputSnapshot::default(),
             prev_vars: HashMap::new(),
-            held: HashSet::new(),
+            overrides: HashMap::new(),
             last_fired: Vec::new(),
             errors: Vec::new(),
         }
@@ -706,7 +725,14 @@ impl Keybinds {
     /// set. Only the first command executes for now, which also enforces the
     /// speedsolving rule of at most one twist per pass.
     pub fn collect(&mut self, ctx: &egui::Context, input: &InputContext) -> Vec<Command> {
-        let now_input = InputSnapshot::capture(ctx, input, &self.held);
+        let mut now_input = InputSnapshot::capture(ctx, input);
+        // A click on the reference holds a key until the real input agrees
+        // with it: press a key you clicked down and the keyboard takes it
+        // back, so it releases when you let go rather than staying stuck.
+        self.overrides
+            .retain(|name, &mut clicked| physical(name, &now_input) != Some(Value::Bool(clicked)));
+        now_input.overrides = self.overrides.clone();
+
         let now_vars: HashMap<String, Value> = self
             .vars
             .iter()
@@ -798,17 +824,23 @@ impl Keybinds {
         })
     }
 
-    /// is the reference holding this variable down?
-    pub fn is_held(&self, variable: &str) -> bool {
-        self.held.contains(variable)
+    /// Is this variable down — clicked down in the reference or pressed for
+    /// real? There's one state, and bindings can't tell the difference. A
+    /// click is answered immediately; the keyboard is as of the last pass,
+    /// which is the freshest anything can be.
+    pub fn is_down(&self, variable: &str) -> bool {
+        if let Some(&clicked) = self.overrides.get(variable) {
+            return clicked;
+        }
+        physical(variable, &self.prev_input) == Some(Value::Bool(true))
     }
 
-    /// Hold or release a variable from the reference. A press it makes is a
-    /// real press: the next pass sees the rising edge and the binding fires.
-    pub fn toggle_held(&mut self, variable: &str) {
-        if !self.held.remove(variable) {
-            self.held.insert(variable.to_string());
-        }
+    /// Toggle a variable from the reference: a key that's down goes up and
+    /// vice versa, however it got that way. A press it makes is a real press —
+    /// the next pass sees the rising edge and the binding fires.
+    pub fn toggle(&mut self, variable: &str) {
+        let down = self.is_down(variable);
+        self.overrides.insert(variable.to_string(), !down);
     }
 
     /// variables are typed, so a set that doesn't match is a mistake worth
@@ -883,8 +915,13 @@ impl Keybinds {
         });
     }
 
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
+    /// `reference_settings` draws the keybind reference's own settings, which
+    /// belong in this tab even though the reference is drawn elsewhere. The
+    /// two components stay independent; the hub hands one to the other.
+    pub fn ui(&mut self, ui: &mut egui::Ui, reference_settings: impl FnOnce(&mut egui::Ui)) {
         ui.heading("keybinds");
+        ui.separator();
+        reference_settings(ui);
         ui.separator();
         self.ui_variables(ui);
         ui.separator();
@@ -1247,8 +1284,12 @@ mod tests {
 
     /// drive a pass without egui: `input` is this frame's state.
     fn pass(keybinds: &mut Keybinds, mut input: InputSnapshot) -> Vec<Command> {
-        // `capture` folds the reference's held variables into the snapshot.
-        input.held = keybinds.held.clone();
+        // `collect` hands a key back to the keyboard once the two agree, then
+        // folds what's left into the snapshot.
+        keybinds
+            .overrides
+            .retain(|name, &mut clicked| physical(name, &input) != Some(Value::Bool(clicked)));
+        input.overrides = keybinds.overrides.clone();
         let now_vars: HashMap<String, Value> = keybinds
             .vars
             .iter()
@@ -1313,7 +1354,7 @@ mod tests {
                 twist: Twist {
                     side: Side::R,
                     layers: LayerMask::OUTER,
-                    multiplicity: -1,
+                    multiplicity: 1,
                 },
                 ..
             }]
@@ -1358,7 +1399,7 @@ mod tests {
             commands[..],
             [Command::Twist {
                 twist: Twist {
-                    multiplicity: 1,
+                    multiplicity: -1,
                     ..
                 },
                 ..
@@ -1397,7 +1438,7 @@ mod tests {
             [Command::Twist {
                 twist: Twist {
                     side: Side::U,
-                    multiplicity: -1,
+                    multiplicity: 1,
                     ..
                 },
                 ..
@@ -1432,10 +1473,9 @@ mod tests {
     #[test]
     fn preview_labels_a_key_without_doing_anything() {
         let mut keybinds = Keybinds::default();
-        // the reference asks this of every key, every frame. the default twist
-        // is one 45 deg step, which is half a quarter turn.
+        // the reference asks this of every key, every frame.
         let preview = keybinds.preview("key_r", None).expect("r is bound");
-        assert_eq!(preview.label, "R/2'");
+        assert_eq!(preview.label, "R/2");
         assert_eq!(preview.location, "twists / key_r");
         assert!(keybinds.preview("key_q", None).is_none());
         // nothing moved: a preview is a question, not a press.
@@ -1449,11 +1489,11 @@ mod tests {
                 ..InputSnapshot::default()
             },
         );
-        assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2");
+        assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2'");
         // and a key already held down still previews, so the reference doesn't
         // blank out the key you're pressing.
         pass(&mut keybinds, holding(&[egui::Key::R]));
-        assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2'");
+        assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2");
     }
 
     #[test]
@@ -1465,7 +1505,7 @@ mod tests {
         let preview = keybinds
             .preview("mouse_left", Some(Side::U))
             .expect("the default set twists on left click");
-        assert_eq!(preview.label, "U/2'");
+        assert_eq!(preview.label, "U/2");
         assert!(matches!(
             preview.command,
             Some(Command::Twist {
@@ -1476,23 +1516,51 @@ mod tests {
     }
 
     #[test]
-    fn a_key_held_by_the_reference_presses_once_and_stays_down() {
+    fn clicking_the_reference_toggles_a_key() {
         let mut keybinds = Keybinds::default();
-        keybinds.toggle_held("key_r");
-        assert!(keybinds.is_held("key_r"));
-        // holding it down is a press.
+        keybinds.toggle("key_r");
+        // clicking it down is a press...
         assert_eq!(pass(&mut keybinds, holding(&[])).len(), 1);
-        // and staying down is not another one.
+        assert!(keybinds.is_down("key_r"));
+        // ...and staying down is not another one.
         assert!(pass(&mut keybinds, holding(&[])).is_empty());
-        // it reads as held everywhere, so a guard on it sees it too. previews
+        // it reads as down everywhere, so a guard on it sees it too. previews
         // are against the last pass, which the app runs every frame.
-        keybinds.toggle_held("key_shift");
+        keybinds.toggle("key_shift");
         pass(&mut keybinds, holding(&[]));
-        assert_eq!(keybinds.preview("key_u", None).unwrap().label, "U/2");
-        // releasing doesn't fire anything.
-        keybinds.toggle_held("key_r");
-        assert!(!keybinds.is_held("key_r"));
+        assert_eq!(keybinds.preview("key_u", None).unwrap().label, "U/2'");
+        // clicking again releases it, and a release fires nothing.
+        keybinds.toggle("key_r");
+        assert!(!keybinds.is_down("key_r"));
         assert!(pass(&mut keybinds, holding(&[])).is_empty());
+    }
+
+    #[test]
+    fn the_keyboard_takes_back_a_key_the_reference_clicked() {
+        let mut keybinds = Keybinds::default();
+        keybinds.toggle("key_r");
+        assert_eq!(pass(&mut keybinds, holding(&[])).len(), 1);
+
+        // press it for real: the override and the keyboard now agree, so the
+        // keyboard owns the key again...
+        assert!(pass(&mut keybinds, holding(&[egui::Key::R])).is_empty());
+        assert!(keybinds.is_down("key_r"));
+        // ...and releasing it really releases it, rather than leaving the
+        // clicked-down state behind.
+        assert!(pass(&mut keybinds, holding(&[])).is_empty());
+        assert!(!keybinds.is_down("key_r"));
+        // so the next physical press is a fresh edge.
+        assert_eq!(pass(&mut keybinds, holding(&[egui::Key::R])).len(), 1);
+    }
+
+    #[test]
+    fn a_real_press_doesnt_answer_for_other_keys() {
+        let mut keybinds = Keybinds::default();
+        // r is pressed for real this pass. asking what *q* would do must not
+        // come back with r's twist, or the whole reference flashes at once.
+        pass(&mut keybinds, tapping(egui::Key::R));
+        assert!(keybinds.preview("key_q", None).is_none());
+        assert_eq!(keybinds.preview("key_r", None).unwrap().label, "R/2");
     }
 
     /// the editor is a lot of tree-walking UI; run it headlessly so a panic in
@@ -1504,7 +1572,9 @@ mod tests {
         pass(&mut keybinds, holding(&[egui::Key::R]));
         let ctx = egui::Context::default();
         let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
-            keybinds.ui(ui);
+            keybinds.ui(ui, |ui| {
+                ui.label("the reference's settings go here");
+            });
             keybinds.pinned_ui(ui);
         });
     }

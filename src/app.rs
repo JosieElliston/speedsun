@@ -164,8 +164,8 @@ impl eframe::App for App {
                 SidebarTab::Filters => self.filters.ui(ui, &self.style_editor.styles),
                 SidebarTab::Styles => self.style_editor.ui(ui),
                 SidebarTab::Keybinds => {
-                    ui.checkbox(&mut self.reference.open, "show reference");
-                    self.keybinds.ui(ui);
+                    let reference = &mut self.reference;
+                    self.keybinds.ui(ui, |ui| reference.settings_ui(ui));
                 }
             });
         });

@@ -109,8 +109,9 @@
 mouse and key events are commands,
 - keyboard layouts other than qwerty
 - mac/not mac cmd/ctrl
-- keybind reference
 - show inline in the folder tree what would happen if a variable were
 toggled
-- the blocked gizmo should be simulating a mouse click, not assuming that "default_multiplicity" and "default_mask" exist
 - i kinda want default_mask to be derived from 3 boolean flags, which then select 3 masks which are then ored together
+- the physical key presses and keybind ref click toggle and status bar variable set should be `Command`s and go in the log file
+- why do we need a separate `overrides`? can't we just toggle whether it's in held set?
+- make the sidebar a horizontal scroll area as well

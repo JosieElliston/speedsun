@@ -196,6 +196,16 @@ impl PuzzleSimulation {
         }
     }
 
+    /// which pieces to tint red for a rejected move: the ones that blocked it,
+    /// or the whole puzzle for a rotation it refuses to make, since no
+    /// particular piece is at fault there.
+    fn flash_pieces(&self, error: TwistError) -> Vec<usize> {
+        match error {
+            TwistError::Blocked(pieces) => pieces,
+            TwistError::FractionalRotation => (0..self.puzzle.pieces.len()).collect(),
+        }
+    }
+
     /// apply a move to the latest state. the twist must have been validated.
     fn apply_move(&mut self, mv: Move) {
         match mv {
@@ -222,7 +232,7 @@ impl PuzzleSimulation {
                 }
                 Err(e) => {
                     self.blocked_flash = Some(BlockedFlash {
-                        pieces: e.blocked,
+                        pieces: self.flash_pieces(e),
                         start: now,
                     });
                 }
@@ -289,7 +299,7 @@ impl PuzzleSimulation {
                 // blocked: drop the twist and flash the blocking pieces.
                 Err(e) => {
                     self.blocked_flash = Some(BlockedFlash {
-                        pieces: e.blocked,
+                        pieces: self.flash_pieces(e),
                         start: now,
                     });
                     continue;

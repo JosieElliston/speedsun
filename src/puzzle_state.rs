@@ -582,9 +582,16 @@ impl Reorientation {
 }
 
 #[derive(Debug)]
-pub struct TwistError {
-    /// indices into pieces of the pieces straddling the twist's boundary.
-    pub blocked: Vec<usize>,
+pub enum TwistError {
+    /// indices into pieces of the pieces straddling the twist's boundary:
+    /// they'd have to be in two layers at once.
+    Blocked(Vec<usize>),
+    /// A 45 deg turn of every layer, which is a rotation of the whole puzzle
+    /// into a frame where no cut plane lines up. Every later twist would be
+    /// blocked, and there are infinitely many such frames — the puzzle jumbles
+    /// without fudging — so it refuses to enter one at all. Notation can still
+    /// write it (`x/2`); the puzzle just won't do it.
+    FractionalRotation,
 }
 
 #[derive(Debug)]
@@ -657,6 +664,12 @@ impl PuzzleState {
     /// fudged piece spanning two layers is exactly the piece that bandages
     /// them together.
     pub fn twist_pieces(&self, twist: Twist) -> Result<Vec<usize>, TwistError> {
+        // a whole-puzzle rotation is a rigid motion, so it can't be blocked by
+        // any piece — but it must land back on the cut planes.
+        if twist.layers == LayerMask::ALL && twist.multiplicity % 2 != 0 {
+            return Err(TwistError::FractionalRotation);
+        }
+
         let mut blocked = Vec::new();
         let mut inside = Vec::new();
 
@@ -688,7 +701,7 @@ impl PuzzleState {
         }
 
         if !blocked.is_empty() {
-            return Err(TwistError { blocked });
+            return Err(TwistError::Blocked(blocked));
         }
 
         Ok(inside)
@@ -763,9 +776,9 @@ mod tests {
         cube.unbandage();
         report("after twist+unbandage", &cube);
         let res = cube.twist(m.inv());
-        if let Err(e) = &res {
-            println!("blocked pieces: {}", e.blocked.len());
-            for &i in e.blocked.iter().take(5) {
+        if let Err(TwistError::Blocked(blocked)) = &res {
+            println!("blocked pieces: {}", blocked.len());
+            for &i in blocked.iter().take(5) {
                 let p = &cube.pieces[i];
                 println!(
                     "  blocked piece: volume={} internal={} stickers={}",
@@ -776,6 +789,26 @@ mod tests {
             }
         }
         assert!(res.is_ok(), "twist back was blocked");
+    }
+
+    #[test]
+    fn a_45_degree_whole_puzzle_rotation_is_refused() {
+        let puzzle = PuzzleState::uncut();
+        let rotate = |multiplicity| {
+            puzzle.twist_pieces(Twist {
+                side: Side::R,
+                layers: LayerMask::ALL,
+                multiplicity,
+            })
+        };
+        // a quarter turn of every layer is a rotation of the whole puzzle:
+        // fine, and nothing can block it.
+        assert!(rotate(2).is_ok());
+        assert!(rotate(-4).is_ok());
+        // 45 deg is not: it lands off the cut planes, where every twist would
+        // be blocked and there are infinitely many places to be.
+        assert!(matches!(rotate(1), Err(TwistError::FractionalRotation)));
+        assert!(matches!(rotate(-3), Err(TwistError::FractionalRotation)));
     }
 
     #[test]
